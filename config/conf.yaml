@@ -1,0 +1,41 @@
+outputpath: experiments
+
+train_label: data/annotation.train.json
+val_label: data/annotation.val.json
+audio_feature: data/logmel.hdf5
+vocab_file: data/vocab.pkl
+dataloader_args:
+    batch_size: 32
+    num_workers: 4
+
+model: Siamese
+model_args:
+    embeddim: 256
+    projdim: 1024
+    use_siamese: False
+
+audio_encoder: CRNNEncoder
+audio_inputdim: 64
+#pretrained_encoder: experiments/pretrained_encoder/CRNN5.pth
+
+text_encoder: EmbeddingEncoder
+#pretrained_embedding: data/word2vec_word.npy
+#tune_embedding: True
+
+pretrained: False
+
+optimizer: Adam
+optimizer_args:
+    lr: 0.001
+    weight_decay: 0.0
+
+improvecriterion: loss
+
+scheduler_args:
+    mode: min
+    factor: 0.1
+    patience: 5
+    threshold: 0.001
+
+early_stop: 10
+epochs: 100
