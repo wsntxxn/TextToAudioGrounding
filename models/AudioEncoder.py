@@ -7,7 +7,6 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-import torchvision
 
 
 def conv1x1(in_planes, out_planes, stride=1):
