@@ -239,13 +239,16 @@ class Runner(object):
                  experiment_path,
                  audio_feature,
                  label_file,
+                 label_meta_file,
                  pred_file="hard_predictions.txt",
                  event_file="event.txt",
                  segment_file="segment.txt",
+                 psds_file="psds.txt",
                  time_ratio=10. / 500,
                  threshold=None,
                  window_size=None):
         from tqdm import tqdm
+        from psds_eval import PSDSEval
 
         from datasets.GroundingDataset import QueryAudioDatasetEval
         import utils.eval_util as eval_util
@@ -266,7 +269,7 @@ class Runner(object):
             dataset,
             shuffle=False,
             collate_fn=collate_fn([0,1]),
-            **config["dataloader_args"])
+            batch_size=1)
 
         model = model.to(self.device).eval()
 
@@ -281,134 +284,69 @@ class Runner(object):
                 })
         strong_label_df = pd.DataFrame(strong_data)
 
-        time_predictions = []
+        if threshold is None:
+            threshold = 0.5
+        thresholds = np.arange(0.0, 1.1, 0.1).tolist()
+        if threshold not in thresholds:
+            thresholds.append(threshold)
+        time_predictions = {th: [] for th in thresholds}
         with torch.no_grad():
             for batch in tqdm(dataloader, unit="batch", ascii=True, ncols=100):
                 infos = batch[2]
-                output = {}
-                if Path(experiment_path).stem == "random":
-                    output["distance"] = torch.as_tensor(np.random.rand(batch[0].size(0), batch[0].size(1)))
-                else:
-                    output = self._forward(model, batch)
-
-                if threshold is None:
-                    threshold = 0.5
-                if window_size is None:
-                    window_size = 1
-
-                filtered_distance = eval_util.median_filter(
-                    output["distance"].cpu(), window_size=window_size, threshold=threshold)
-                for idx in range(len(infos)):
-                    info = infos[idx]
-                    change_indices = eval_util.find_contiguous_regions(filtered_distance[idx])
-                    for row in change_indices:
-                        time_predictions.append({
-                            "filename": "{}/{}".format(info["audiocap_id"], info["start_word"]),
-                            "event_label": "fake_event",
-                            "onset": row[0],
-                            "offset": row[1]
-                        })
-
-        assert len(time_predictions) > 0, "No outputs, lower threshold?"
-        pred_df = pd.DataFrame(time_predictions)
-        pred_df = eval_util.predictions_to_time(pred_df, ratio=time_ratio)
-        pred_df.to_csv(str(Path(experiment_path) / pred_file), index=False, sep="\t")
-
-        event_result, segment_result = metrics.compute_metrics(
-            strong_label_df, pred_df, time_resolution=1.0)
-        event_results_dict = event_result.results_class_wise_metrics()
-
-        with open(str(Path(experiment_path) / event_file), "w") as f:
-            f.write(event_result.__str__())
-
-        with open(str(Path(experiment_path) / segment_file), "w") as f:
-            f.write(segment_result.__str__())
-
-    def predict(self,
-                experiment_path,
-                audio_feature,
-                label_file,
-                pred_file="hard_predictions.txt",
-                time_ratio=10. / 500,
-                window_size=None):
-        from tqdm import tqdm
-
-        from datasets.GroundingDataset import QueryAudioDatasetEval
-        import utils.eval_util as eval_util
-        import utils.metrics as metrics
-
-        saved = torch.load(str(Path(experiment_path) / "saved.pth"), map_location="cpu")
-        config = saved["config"]
-        with open(config["vocab_file"], "rb") as vocab_reader:
-            vocabulary = pickle.load(vocab_reader)
-        model = self._get_model(config, vocabulary)
-        model.load_state_dict(saved["model"], strict=False)
-
-        label_df = pd.read_json(label_file)
-        dataset = QueryAudioDatasetEval(
-            audio_feature, label_df, query_form="wordids", vocabulary=vocabulary)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            shuffle=False,
-            collate_fn=collate_fn([0,1]),
-            **config["dataloader_args"])
-
-        model = model.to(self.device).eval()
-
-        strong_data = []
-        for idx, row in label_df.iterrows():
-            for onset, offset in row["timestamps"]:
-                strong_data.append({
-                    "filename": "{}/{}".format(row["audiocap_id"], row["start_word"]),
-                    "event_label": "fake_event",
-                    "onset": onset,
-                    "offset": offset
-                })
-        strong_label_df = pd.DataFrame(strong_data)
-
-        time_predictions = {th: [] for th in np.arange(0.1, 1.1, 0.1)}
-        with torch.no_grad():
-            for batch in tqdm(dataloader, unit="batch", ascii=True, ncols=100):
-                infos = batch[2]
-                audio_feats = batch[0]
-                output = {}
-                if Path(experiment_path).stem == "random":
-                    output["distance"] = torch.as_tensor(np.random.rand(batch[0].size(0), batch[0].size(1)))
-                else:
-                    output = self._forward(model, batch)
+                output = self._forward(model, batch)
 
                 if window_size is None:
                     window_size = 1
 
-                for threshold in np.arange(0.1, 1.0, 0.1):
+                for th in thresholds:
                     filtered_probs = eval_util.median_filter(
-                        output["distance"].cpu(), window_size=window_size, threshold=threshold)
+                        output["distance"].cpu(), window_size=window_size, threshold=th)
                     for idx in range(len(infos)):
                         info = infos[idx]
                         change_indices = eval_util.find_contiguous_regions(filtered_probs[idx])
                         for row in change_indices:
-                            time_predictions[threshold].append({
+                            time_predictions[th].append({
                                 "filename": "{}/{}".format(info["audiocap_id"], info["start_word"]),
                                 "event_label": "fake_event",
                                 "onset": row[0],
                                 "offset": row[1]
                             })
 
-        for threshold in np.arange(0.1, 1.0, 0.1):
-            pred_df = pd.DataFrame(time_predictions[threshold])
+        if not (Path(experiment_path) / "predictions_for_psds").exists():
+            (Path(experiment_path) / "predictions_for_psds").mkdir()
+
+        for th in thresholds:
+            if len(time_predictions[th]) > 0:
+                pred_df = pd.DataFrame(time_predictions[th])
+            else:
+                pred_df = pd.DataFrame({"filename": [], "event_label": [], "onset": [], "offset": []})
             pred_df = eval_util.predictions_to_time(pred_df, ratio=time_ratio)
-            pred_file_th = pred_file.split(".")[0] + "_TH_{:.1f}.".format(threshold) + pred_file.split(".")[-1]
-            pred_df.to_csv(str(Path(experiment_path) / pred_file_th), index=False, sep="\t")
+            pred_df.to_csv(Path(experiment_path) / f"predictions_for_psds/th_{th:.1f}.csv", index=False, sep="\t")
+            if th == threshold:
+                pred_df.to_csv(str(Path(experiment_path) / pred_file), index=False, sep="\t")
+                event_result, segment_result = metrics.compute_metrics(
+                    strong_label_df, pred_df, time_resolution=1.0)
+                event_results_dict = event_result.results_class_wise_metrics()
 
-        # event_result, segment_result = metrics.compute_metrics(
-        # strong_label_df, pred_df, time_resolution=1.0)
-        # event_results_dict = event_result.results_class_wise_metrics()
+                with open(str(Path(experiment_path) / event_file), "w") as f:
+                    f.write(event_result.__str__())
 
-        # with open(str(Path(experiment_path) / event_file), "w") as f:
-        # f.write(event_result.__str__())
+                with open(str(Path(experiment_path) / segment_file), "w") as f:
+                    f.write(segment_result.__str__())
 
-        # with open(str(Path(experiment_path) / segment_file), "w") as f:
-        # f.write(segment_result.__str__())
+        meta_df = pd.read_csv(label_meta_file, sep="\t")
+        psds_eval = PSDSEval(0.5, 0.5, 0.3, ground_truth=strong_label_df, metadata=meta_df)
+        for i, th in enumerate(np.arange(0.1, 1.1, 0.1)):
+            csv_file = Path(experiment_path) / f"predictions_for_psds/th_{th:.1f}.csv"
+            det_t = pd.read_csv(csv_file, sep="\t")
+            info = {"name": f"Op {i + 1}", "threshold": th}
+            psds_eval.add_operating_point(det_t, info=info)
+            print(f"\rOperating point {i+1} added", end=" ")
+        print()
+        psds = psds_eval.psds(0.0, 0.0, 100)
+        with open(str(Path(experiment_path) / psds_file), "w") as f:
+            f.write(f"PSD-Score: {psds.value:.5f}\n")
+
 
 if __name__ == "__main__":
     fire.Fire(Runner)
