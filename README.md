@@ -37,7 +37,6 @@ python run.py train config/conf.yaml
 ```bash
 export EXP_PATH=***
 export AUDIO_FEATURE=***
-export LABEL_FILE=data/annotation.test.json
-python run.py evaluate $EXP_PATH $AUDIO_FEATURE $LABEL_FILE
+python run.py evaluate $EXP_PATH $AUDIO_FEATURE data/test.json data/test_meta.csv
 ```
 where `EXP_PATH` and `AUDIO_FEATURE` are the experiment checkpoint directory and audio feature file corresponding to your configuration.
