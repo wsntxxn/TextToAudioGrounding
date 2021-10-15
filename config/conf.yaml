@@ -1,41 +1,56 @@
 outputpath: experiments
 
-train_label: data/annotation.train.json
-val_label: data/annotation.val.json
-audio_feature: data/logmel.hdf5
-vocab_file: data/vocab.pkl
+data:
+    train:
+        label: data/train/label.json
+        audio_feature: data/train/lms.csv
+    val:
+        label: data/val/label.json
+        audio_feature: data/val/lms.csv
+    vocab_file: data/train/vocab.pkl
+
 dataloader_args:
-    batch_size: 32
+    batch_size: 128
     num_workers: 4
 
-model: Siamese
-model_args:
-    embeddim: 256
-    projdim: 1024
-    use_siamese: False
+audio_encoder: 
+    type: CrnnEncoder
+    args:
+        input_dim: 64
+        embed_dim: 256
 
-audio_encoder: CRNNEncoder
-audio_inputdim: 64
-#pretrained_encoder: experiments/pretrained_encoder/CRNN5.pth
+text_encoder: 
+    type: EmbeddingMeanEncoder
+    args:
+        embed_dim: 256
 
-text_encoder: EmbeddingEncoder
-#pretrained_embedding: data/word2vec_word.npy
-#tune_embedding: True
+similarity_fn: 
+    type: ExponentialNegativeL2
+    args: {}
 
-pretrained: False
+model: 
+    type: NaiveModel
+    args: {}
 
-optimizer: Adam
-optimizer_args:
-    lr: 0.001
-    weight_decay: 0.0
+loss: 
+    type: BinaryCrossEntropyLoss
+    args: {}
+
+optimizer: 
+    type: Adam
+    args:
+        lr: 0.001
+        weight_decay: 0.0
 
 improvecriterion: loss
 
-scheduler_args:
-    mode: min
-    factor: 0.1
-    patience: 5
-    threshold: 0.001
+lr_scheduler:
+    type: ReduceLROnPlateau
+    args:
+        mode: min
+        factor: 0.1
+        patience: 5
+        threshold: 0.001
 
 early_stop: 10
 epochs: 100
