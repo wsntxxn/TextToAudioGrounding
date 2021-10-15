@@ -1,9 +1,8 @@
-from tqdm import tqdm
-import pandas as pd
-import logging
+import json
 import pickle
-import re
-import fire
+import argparse
+from typing import List
+
 
 class Vocabulary(object):
     """Simple vocabulary wrapper."""
@@ -19,29 +18,40 @@ class Vocabulary(object):
             self.idx += 1
 
     def __call__(self, word):
+        if not word in self.word2idx:
+            return self.word2idx["<unk>"]
         return self.word2idx[word]
 
     def __len__(self):
         return len(self.word2idx)
 
 
-def process(input:str, output:str):
+def process(items: List, output: str):
     print("Build Vocab")
-    label_df = pd.read_json(input)
 
     # Create a vocab wrapper and add some special tokens.
     vocab = Vocabulary()
-    vocab.add_word('<pad>')
+    vocab.add_word("<pad>")
+    vocab.add_word("<unk>")
 
     # Add the words to the vocabulary.
-    for tokens in label_df["tokens"]:
+    for item in items:
+        tokens = item["tokens"].split()
         for token in tokens:
             vocab.add_word(token)
-    with open(output, "wb") as store:
-        pickle.dump(vocab, store)
+    pickle.dump(vocab, open(output, "wb"))
     print("Total vocabulary size: {}".format(len(vocab)))
     print("Saved vocab to '{}'".format(output))
 
 
 if __name__ == '__main__':
-    fire.Fire(process)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("labels", nargs="+", type=str)
+    parser.add_argument("output", type=str)
+
+    args = parser.parse_args()
+    data = []
+    for label in args.labels:
+        items = json.load(open(label))
+        data.extend(items)
+    process(data, args.output)

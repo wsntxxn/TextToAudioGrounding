@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
-import os
 import sys
 import logging
-import datetime
 import yaml
 import torch
 import numpy as np
 import pandas as pd
 from pprint import pformat
+
+
+def load_dict_from_csv(csv, cols):
+    df = pd.read_csv(csv, sep="\t")
+    output = dict(zip(df[cols[0]], df[cols[1]]))
+    return output
 
 def genlogger(outputfile, level="INFO"):
     formatter = logging.Formatter(
@@ -65,24 +69,6 @@ def parse_config_or_kwargs(config_file, **kwargs):
     # passed kwargs will override yaml config
     return dict(yaml_config, **kwargs)
 
-
-# def parse_augments(augment_list):
-    # """parse_transforms
-    # parses the transformation string in configuration file to corresponding methods
-
-    # :param transform_list: list
-    # """
-    # from datasets import augment
-
-    # augments = []
-    # for transform in augment_list:
-        # if transform == "timemask":
-            # augments.append(augment.TimeMask(1, 50))
-        # elif transform == "freqmask":
-            # augments.append(augment.FreqMask(1, 10))
-    # return torch.nn.Sequential(*augments)
-
-
 def criterion_improver(mode):
     assert mode in ("loss", "acc", "score", "F1")
     best_value = np.inf if mode == "loss" else 0
@@ -129,7 +115,7 @@ def log_results(engine,
 
 
 def save_model_on_improved(engine,
-                           criterion_improved, 
+                           criterion_improved,
                            metric_key,
                            dump,
                            save_path):
@@ -137,6 +123,10 @@ def save_model_on_improved(engine,
         torch.save(dump, save_path)
 
 
-def update_reduce_on_plateau(engine, scheduler, metric):
-    cv_loss = engine.state.metrics[metric]
-    scheduler.step(cv_loss)
+def update_lr(engine, scheduler, metric=None):
+    if scheduler.__class__.__name__ == "ReduceLROnPlateau":
+        assert metric is not None, "need validation metric for ReduceLROnPlateau"
+        val_result = engine.state.metrics[metric]
+        scheduler.step(val_result)
+    else:
+        scheduler.step()

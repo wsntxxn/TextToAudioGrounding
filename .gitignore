@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+*/__pycache__
 *.py[cod]
 *$py.class
 
@@ -117,3 +118,8 @@ experiments/*
 
 # Slurm logs
 logs/
+
+# Data files
+data/train
+data/val
+data/test
