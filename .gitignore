@@ -106,11 +106,9 @@ venv.bak/
 # mypy
 .mypy_cache/
 
-# tensorboardX visualization
-runs/*
-
 # Results
 experiments/*
+experiments_dataresplit/*
 
 # Vscode/vim files
 .vscode/
@@ -120,6 +118,13 @@ experiments/*
 logs/
 
 # Data files
+data/random_resplit/audio
+data/all
+data/audiocaps
 data/train
 data/val
 data/test
+data/old_label
+dataset_creation/annotation
+dataset_creation/random_resplit
+dataset_creation/update_data

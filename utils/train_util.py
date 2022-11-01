@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 import sys
+import importlib
+import random
+import os
 import logging
 import yaml
 import torch
 import numpy as np
 import pandas as pd
 from pprint import pformat
+from torch.optim.swa_utils import AveragedModel as torch_average_model
 
 
 def load_dict_from_csv(csv, cols):
@@ -14,76 +18,209 @@ def load_dict_from_csv(csv, cols):
     output = dict(zip(df[cols[0]], df[cols[1]]))
     return output
 
-def genlogger(outputfile, level="INFO"):
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+class Mixup(object):
+    def __init__(self, mixup_alpha, random_seed=1234):
+        """Mixup coefficient generator.
+        """
+        self.mixup_alpha = mixup_alpha
+        self.random_state = np.random.RandomState(random_seed)
+
+    def get_lambda(self, batch_size):
+        """Get mixup random coefficients.
+        Args:
+          batch_size: int
+        Returns:
+          mixup_lambdas: (batch_size,)
+        """
+        mixup_lambdas = []
+        for n in range(0, batch_size, 2):
+            lam = self.random_state.beta(self.mixup_alpha, self.mixup_alpha, 1)[0]
+            mixup_lambdas.append(lam)
+            mixup_lambdas.append(1. - lam)
+
+        return np.array(mixup_lambdas)
+
+
+def do_mixup(x, mixup_lambdas):
+    """Mixup x of even indexes (0, 2, 4, ...) with x of odd indexes
+    (1, 3, 5, ...).
+
+    Args:
+      x: (batch_size * 2, ...)
+      mixup_lambda: (batch_size * 2,)
+
+    Returns:
+      out: (batch_size, ...)
+    """
+    mixup_lambdas = torch.as_tensor(mixup_lambdas, dtype=torch.float).to(x.device)
+    out = (x[0 :: 2].transpose(0, -1) * mixup_lambdas[0 :: 2] + \
+        x[1 :: 2].transpose(0, -1) * mixup_lambdas[1 :: 2]).transpose(0, -1)
+    return out
+
+
+def init_logger(filename, level="INFO"):
+    filename = filename.__str__()
     formatter = logging.Formatter(
         "[ %(levelname)s : %(asctime)s ] - %(message)s")
-    logger = logging.getLogger(__name__ + "." + outputfile)
+    logger = logging.getLogger(__name__ + "." + filename)
     logger.setLevel(getattr(logging, level))
-    # Log results to std
-    # stdhandler = logging.StreamHandler(sys.stdout)
-    # stdhandler.setFormatter(formatter)
-    # Dump log to file
-    filehandler = logging.FileHandler(outputfile)
+    filehandler = logging.FileHandler(filename)
     filehandler.setFormatter(formatter)
     logger.addHandler(filehandler)
-    # logger.addHandler(stdhandler)
     return logger
 
 
-def pprint_dict(in_dict, outputfun=sys.stdout.write, formatter='yaml'):
+def pprint_dict(in_dict, print_fn=sys.stdout.write, format='yaml'):
     """pprint_dict
 
     :param outputfun: function to use, defaults to sys.stdout
     :param in_dict: dict to print
     """
-    if formatter == 'yaml':
-        format_fun = yaml.dump
-    elif formatter == 'pretty':
-        format_fun = pformat
-    for line in format_fun(in_dict).split('\n'):
-        outputfun(line)
+    if format == 'yaml':
+        format_fn = yaml.dump
+    elif format == 'pretty':
+        format_fn = pformat
+    else:
+        raise Exception(f"format {format} not supported")
+    for line in format_fn(in_dict).split('\n'):
+        print_fn(line)
 
 
-def encode_labels(labels: pd.Series, encoder=None):
-    """encode_labels
+def init_obj(module, config, **kwargs):
+    obj_args = config["args"].copy()
+    obj_args.update(kwargs)
+    return getattr(module, config["type"])(**obj_args)
 
-    Encodes labels
 
-    :param labels: pd.Series representing the raw labels e.g., Speech, Water
-    :param encoder (optional): Encoder already fitted 
-    returns encoded labels (one hot) and the encoder
-    """
-    import sklearn.preprocessing as pre
+def get_obj_from_str(string, reload=False):
+    module, cls = string.rsplit('.', 1)
+    if reload:
+        module_imp = importlib.import_module(module)
+        importlib.reload(module_imp)
+    return getattr(importlib.import_module(module, package=None), cls)
 
-    assert isinstance(labels, pd.Series), "Labels need to series"
-    if not encoder:
-        encoder = pre.LabelEncoder()
-        encoder.fit(labels)
-    labels_encoded = encoder.transform(labels)
-    return labels_encoded.tolist(), encoder
+
+def init_obj_from_str(config, **kwargs):
+    obj_args = config["args"].copy()
+    obj_args.update(kwargs)
+    cls = get_obj_from_str(config["type"])
+    obj = cls(**obj_args)
+    return obj
+
+
+def merge_a_into_b(a, b):
+    # merge dict a into dict b. values in a will overwrite b.
+    for k, v in a.items():
+        if isinstance(v, dict) and k in b:
+            assert isinstance(
+                b[k], dict
+            ), "Cannot inherit key '{}' from base!".format(k)
+            merge_a_into_b(v, b[k])
+        else:
+            b[k] = v
+
+
+def load_config(config_file):
+    with open(config_file, "r") as reader:
+        config = yaml.load(reader, Loader=yaml.FullLoader)
+    if "inherit_from" in config:
+        base_config_file = config["inherit_from"]
+        base_config_file = os.path.join(
+            os.path.dirname(config_file), base_config_file
+        )
+        assert not os.path.samefile(config_file, base_config_file), \
+            "inherit from itself"
+        base_config = load_config(base_config_file)
+        del config["inherit_from"]
+        merge_a_into_b(config, base_config)
+        return base_config
+    return config
 
 
 def parse_config_or_kwargs(config_file, **kwargs):
-    with open(config_file) as con_read:
-        yaml_config = yaml.load(con_read, Loader=yaml.FullLoader)
+    yaml_config = load_config(config_file)
     # passed kwargs will override yaml config
-    return dict(yaml_config, **kwargs)
+    args = dict(yaml_config, **kwargs)
+    return args
 
-def criterion_improver(mode):
-    assert mode in ("loss", "acc", "score", "F1")
-    best_value = np.inf if mode == "loss" else 0
 
-    def comparator(x, best_x):
-        return x < best_x if mode == "loss" else x > best_x
+def count_parameters(model):
+    num_params = 0
+    for param in model.parameters():
+        num_params += param.numel()
+    return num_params
 
-    def inner(x):
-        nonlocal best_value
 
-        if comparator(x, best_value):
-            best_value = x
+def pack_length(padded, lengths):
+    packed = []
+    for i in range(len(lengths)):
+        packed.append(padded[i][:lengths[i], ...])
+    return torch.cat(packed)
+
+
+def load_pretrained_model(model,
+                          pretrained,
+                          output_fn=sys.stdout.write,
+                          **load_args):
+    if not isinstance(pretrained, dict) and not os.path.exists(pretrained):
+        output_fn(f"pretrained {pretrained} not exist!")
+        return
+    
+    if hasattr(model, "load_pretrained"):
+        model.load_pretrained(pretrained, output_fn, **load_args)
+        return
+
+    if isinstance(pretrained, dict):
+        state_dict = pretrained
+    else:
+        state_dict = torch.load(pretrained, map_location="cpu")
+
+    if "model" in state_dict:
+        state_dict = state_dict["model"]
+    model_dict = model.state_dict()
+    pretrained_dict = {
+        k: v for k, v in state_dict.items() if (k in model_dict) and (
+            model_dict[k].shape == v.shape)
+    }
+    output_fn(f"Loading pretrained keys {pretrained_dict.keys()}")
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict, strict=True)
+
+
+class MetricImprover:
+
+    def __init__(self, mode):
+        assert mode in ("min", "max")
+        self.mode = mode
+        # min: lower -> better; max: higher -> better
+        self.best_value = np.inf if mode == "min" else -np.inf
+
+    def compare(self, x, best_x):
+        return x < best_x if self.mode == "min" else x > best_x
+
+    def __call__(self, x):
+        if self.compare(x, self.best_value):
+            self.best_value = x
             return True
         return False
-    return inner
+
+    def state_dict(self):
+        return self.__dict__
+
+    def load_state_dict(self, state_dict):
+        self.__dict__.update(state_dict)
 
 
 def log_results(engine,
@@ -130,3 +267,26 @@ def update_lr(engine, scheduler, metric=None):
         scheduler.step(val_result)
     else:
         scheduler.step()
+
+
+class AveragedModel(torch_average_model):
+
+    def update_parameters(self, model):
+        for p_swa, p_model in zip(self.parameters(), model.parameters()):
+            device = p_swa.device
+            p_model_ = p_model.detach().to(device)
+            if self.n_averaged == 0:
+                p_swa.detach().copy_(p_model_)
+            else:
+                p_swa.detach().copy_(self.avg_fn(p_swa.detach(), p_model_,
+                                                 self.n_averaged.to(device)))
+
+        for b_swa, b_model in zip(list(self.buffers())[1:], model.buffers()):
+            device = b_swa.device
+            b_model_ = b_model.detach().to(device)
+            if self.n_averaged == 0:
+                b_swa.detach().copy_(b_model_)
+            else:
+                b_swa.detach().copy_(self.avg_fn(b_swa.detach(), b_model_,
+                                                 self.n_averaged.to(device)))
+        self.n_averaged += 1

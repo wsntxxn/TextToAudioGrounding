@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 def init_weights(m):
     if isinstance(m, (nn.Conv2d, nn.Conv1d)):
         nn.init.kaiming_normal_(m.weight)
@@ -17,6 +18,7 @@ def init_weights(m):
     elif isinstance(m, nn.Embedding):
         nn.init.kaiming_uniform_(m.weight)
 
+
 def generate_length_mask(lens, max_length=None):
     lens = torch.as_tensor(lens)
     N = lens.size(0)
@@ -26,11 +28,8 @@ def generate_length_mask(lens, max_length=None):
     mask = (idxs < lens.view(-1, 1))
     return mask
 
-def mean_with_lens(features, lens):
-    """
-    features: [N, T, ...] (assume the second dimension represents length)
-    lens: [N,]
-    """
+
+def sum_with_lens(features, lens):
     lens = torch.as_tensor(lens)
     if max(lens) != features.size(1):
         max_length = features.size(1)
@@ -41,9 +40,39 @@ def mean_with_lens(features, lens):
 
     while mask.ndim < features.ndim:
         mask = mask.unsqueeze(-1)
-    feature_mean = features * mask
-    feature_mean = feature_mean.sum(1)
-    while lens.ndim < feature_mean.ndim:
+    feature_masked = features * mask
+    feature_sum = feature_masked.sum(1)
+    return feature_sum
+
+
+def mean_with_lens(features, lens):
+    """
+    features: [N, T, ...] (assume the second dimension represents length)
+    lens: [N,]
+    """
+    feature_sum = sum_with_lens(features, lens)
+    while lens.ndim < feature_sum.ndim:
         lens = lens.unsqueeze(1)
-    feature_mean = feature_mean / lens.to(features.device)
+    feature_mean = feature_sum / lens.to(features.device)
     return feature_mean
+
+
+def max_with_lens(features, lens):
+    """
+    features: [N, T, ...] (assume the second dimension represents length)
+    lens: [N,]
+    """
+    lens = torch.as_tensor(lens)
+    mask = generate_length_mask(lens).to(features.device) # [N, T]
+
+    feature_max = features.clone()
+    feature_max[~mask] = float("-inf")
+    feature_max, _ = feature_max.max(1)
+    return feature_max
+
+
+def linear_softmax_with_lens(features, lens):
+    return sum_with_lens(features ** 2, lens) / sum_with_lens(features, lens)
+
+
+
