@@ -20,7 +20,7 @@ class ExpNegL2(nn.Module):
         return score
 
 
-class Fc(nn.Module):
+class ConcatFc(nn.Module):
     
     def __init__(self, embed_dim):
         super().__init__()
@@ -36,25 +36,23 @@ class Fc(nn.Module):
 
 class DotProduct(nn.Module):
 
-    def __init__(self, clamp="linear") -> None:
+    def __init__(self, activation="sigmoid", l2norm=False) -> None:
         super().__init__()
-        self.clamp = clamp
+        self.l2norm = l2norm
+        assert activation in ("clamp", "sigmoid"), f"unsupported activation {activation}"
+        self.activation = activation
         
     def forward(self, audio: torch.Tensor, text: torch.Tensor, **kwargs):
         audio = F.normalize(audio, dim=-1)
         text = F.normalize(text, dim=-1)
         text = text.unsqueeze(1)
         score = torch.bmm(audio, text.transpose(1, 2)).squeeze(2)
-        if self.clamp == "linear":
-            return (1 + score) / 2
-        else:
-            return torch.clamp(score, 1e-7, 1.0)
+        if self.activation == "sigmoid":
+            score = torch.sigmoid(score)
+        return torch.clamp(score, 1e-7, 1.0)
 
 
 class ScaledDotProduct(nn.Module):
-
-    def __init__(self) -> None:
-        super().__init__()
 
     def forward(self, audio: torch.Tensor, text: torch.Tensor, **kwargs):
         d = audio.size(-1)

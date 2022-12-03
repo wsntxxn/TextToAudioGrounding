@@ -265,6 +265,7 @@ class Runner(object):
     def eval_psds(self, dataloader, data_duration, return_score=True):
         ground_truth = []
         for audio_item in dataloader.dataset.data:
+            audio_id = audio_item["audio_id"]
             audiocap_id = audio_item["audiocap_id"]
             for phrase_item in audio_item["phrases"]:
                 start_index = phrase_item["start_index"]
@@ -276,7 +277,8 @@ class Runner(object):
                         "filename": fname,
                         "event_label": "fake_event",
                         "onset": onset,
-                        "offset": offset
+                        "offset": offset,
+                        "audio_id": audio_id
                     })
         ground_truth = pd.DataFrame(ground_truth)
 
@@ -355,6 +357,97 @@ class Runner(object):
         return output
 
 
+    def eval_th_auc(self, dataloader, return_score=True):
+        ground_truth = []
+        for audio_item in dataloader.dataset.data:
+            audiocap_id = audio_item["audiocap_id"]
+            for phrase_item in audio_item["phrases"]:
+                start_index = phrase_item["start_index"]
+                fname = f"{audiocap_id}_{start_index}"
+                for onset, offset in phrase_item["segments"]:
+                    if onset == 0 and offset == 0:
+                        continue
+                    ground_truth.append({
+                        "filename": fname,
+                        "event_label": "fake_event",
+                        "onset": onset,
+                        "offset": offset
+                    })
+        ground_truth = pd.DataFrame(ground_truth)
+
+        n_thresholds = self.config["eval_config"]["n_thresholds"]
+        thresholds = np.arange(
+            1 / (n_thresholds * 2), 1, 1 / n_thresholds)
+        pred_buffer = {th: [] for th in thresholds}
+
+        window_size = self.config["inference_args"]["window_size"]
+        time_resolution = self.config["inference_args"]["time_resolution"]
+        n_connect = math.ceil(0.5 / time_resolution)
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch in tqdm(dataloader, unit="batch",
+                              ascii=True, ncols=100, leave=False):
+                output = self.forward(batch, training=False)
+                for th in thresholds:
+                    for idx in range(len(batch["audiocap_id"])):
+                        audiocap_id = batch["audiocap_id"][idx]
+                        start_index = batch["start_index"][idx]
+                        end_index = batch["end_index"][idx]
+                        prob = output["sim"][idx, idx, :, start_index: end_index + 1].cpu()
+                        prob = prob.mean(1)
+                        filtered_prob = eval_util.median_filter(
+                            prob[:, np.newaxis],
+                            window_size=window_size,
+                            threshold=th
+                        )[:, 0]
+                        fname = f"{audiocap_id}_{start_index}"
+                        if fname not in ground_truth["filename"].unique():
+                            continue
+                        change_indices = eval_util.find_contiguous_regions(
+                            eval_util.connect_clusters(
+                                filtered_prob,
+                                n_connect
+                            )
+                        )
+                        for row in change_indices:
+                            pred_buffer[th].append({
+                                "filename": fname,
+                                "event_label": "fake_event",
+                                "onset": row[0],
+                                "offset": row[1]
+                            })
+
+        for th in thresholds:
+            if len(pred_buffer[th]) > 0:
+                pred_df = pd.DataFrame(pred_buffer[th])
+            else:
+                pred_df = pd.DataFrame({
+                    "filename": [],
+                    "event_label": [],
+                    "onset": [],
+                    "offset": []
+                })
+            pred_df = eval_util.predictions_to_time(
+                pred_df, ratio=time_resolution)
+            pred_buffer[th] = pred_df
+
+        output = {
+            "pred_buffer": pred_buffer,
+            "ground_truth": ground_truth
+        }
+
+        if return_score:
+            th_auc = eval_util.compute_th_auc(
+                pred_buffer,
+                ground_truth,
+                dtc_threshold=0.5,
+                gtc_threshold=0.5,
+            )
+            output["th_auc"] = th_auc
+        
+        return output
+
     def eval_sed_scores(self, dataloader):
         import sed_scores_eval
 
@@ -375,8 +468,7 @@ class Runner(object):
                     ))
 
         event_classes = ["fake_event"]
-        time_resolution = self.config["data"]["train"]["dataset"][
-            "args"]["time_resolution"]
+        time_resolution = self.config["inference_args"]["time_resolution"]
         scores = {}
         self.model.eval()
         with torch.no_grad():
@@ -389,9 +481,9 @@ class Runner(object):
                     fname = f"{audiocap_id}_{start_index}"
                     if fname not in ground_truth.keys():
                         continue
-                    scores_arr = output["prob"][idx, idx, :, start_index: end_idx + 1]
+                    scores_arr = output["sim"][idx, idx, :, start_index: end_idx + 1]
                     scores_arr = scores_arr.mean(1, keepdim=True).cpu().numpy()
-                    timestamps = np.arange(output["prob"].shape[1] + 1) * \
+                    timestamps = np.arange(output["sim"].shape[2] + 1) * \
                         time_resolution
                     scores[fname] = sed_scores_eval.utils.create_score_dataframe(
                         scores_arr, timestamps=timestamps,
@@ -401,6 +493,72 @@ class Runner(object):
             "ground_truth": ground_truth,
             "scores": scores
         }
+
+
+    def evaluate_th_auc(self, experiment_path, eval_config):
+        eval_config = train_util.parse_config_or_kwargs(eval_config)
+
+        exp_dir = Path(experiment_path)
+        self.config = train_util.parse_config_or_kwargs(exp_dir / "config.yaml" )
+        self.config["resume"] = exp_dir / eval_config["resume"]
+        self.config["inference_args"] = {
+            "time_resolution": eval_config["time_resolution"],
+            "window_size": eval_config["window_size"]
+        }
+        self.config["eval_config"] = {
+            "n_thresholds": eval_config["n_thresholds"]
+        }
+        self.model = self.get_model(print)
+        self.resume_checkpoint(finetune=True)
+        
+        if "vocabulary" in self.config["data"]["train"]["dataset"]["args"]:
+            eval_config["data"]["test"]["dataset"]["args"][
+                "vocabulary"] = self.config["data"]["train"]["dataset"]["args"][
+                    "vocabulary"]
+        dataset = train_util.init_obj_from_str(
+            eval_config["data"]["test"]["dataset"])
+        collate_fn = train_util.init_obj_from_str(
+            eval_config["data"]["test"]["collate_fn"])
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            shuffle=False,
+            collate_fn=collate_fn,
+            batch_size=1)
+
+        self.model = self.model.to(self.device)
+
+        output = self.eval_th_auc(dataloader,
+                                  return_score=False)
+        
+        pred_buffer = output["pred_buffer"]
+        ground_truth = output["ground_truth"]
+
+        pred_dir = exp_dir / "predictions"
+        pred_dir.mkdir(exist_ok=True)
+        for th in pred_buffer:
+            pred_buffer[th].to_csv(
+                pred_dir / f"predictions_th_{th:.2f}.tsv",
+                sep="\t",
+                index=False,
+            )
+
+        th_auc_dir = eval_config.get("th_auc_dir", "th_auc")
+
+        th_auc_scenario1 = eval_util.compute_th_auc(
+            pred_buffer,
+            ground_truth,
+            dtc_threshold=0.5,
+            gtc_threshold=0.5,
+            save_dir=exp_dir / th_auc_dir,
+        )
+
+        f_output = exp_dir / eval_config["output_th_auc"]
+        if not f_output.parent.exists():
+            f_output.parent.mkdir(parents=True)
+        with open(f_output.__str__(), "w") as writer:
+            print(f"th_auc_scenario1: {th_auc_scenario1:.1%}")
+            print(f"th_auc_scenario1: {th_auc_scenario1:.1%}", file=writer)
+
 
     def evaluate_psds(self, experiment_path, eval_config):
         eval_config = train_util.parse_config_or_kwargs(eval_config)
@@ -427,6 +585,10 @@ class Runner(object):
 
         self.model = self.model.to(self.device)
 
+        self.config["eval_config"] = {"n_thresholds": eval_config["n_thresholds"]}
+        self.config["inference_args"] = {
+            "window_size": eval_config["window_size"],
+            "time_resolution": eval_config["time_resolution"] }
         output = self.eval_psds(dataloader,
                                 eval_config["data"]["test"]["duration"],
                                 return_score=False)
@@ -479,50 +641,6 @@ class Runner(object):
             print(f"psds_scenario2: {psds_score_scenario2:.1%}", file=writer)
             print(f"psds_scenario3: {psds_score_scenario3:.1%}")
             print(f"psds_scenario3: {psds_score_scenario3:.1%}", file=writer)
-
-
-    def evaluate_intersection_auc(self, experiment_path, eval_config):
-
-        eval_config = train_util.parse_config_or_kwargs(eval_config)
-
-        exp_dir = Path(experiment_path)
-        self.config = train_util.parse_config_or_kwargs(exp_dir / "config.yaml" )
-        self.config["resume"] = exp_dir / eval_config["resume"]
-        self.model = self.get_model(print)
-        self.resume_checkpoint(finetune=True)
-        
-        if "vocabulary" in self.config["data"]["train"]["dataset"]["args"]:
-            eval_config["data"]["test"]["dataset"]["args"][
-                "vocabulary"] = self.config["data"]["train"]["dataset"]["args"][
-                    "vocabulary"]
-        dataset = train_util.init_obj_from_str(
-            eval_config["data"]["test"]["dataset"])
-        collate_fn = train_util.init_obj_from_str(
-            eval_config["data"]["test"]["collate_fn"])
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            shuffle=False,
-            collate_fn=collate_fn,
-            batch_size=1)
-
-        self.model = self.model.to(self.device)
-
-        output = self.eval_sed_scores(dataloader)
-
-        result = eval_util.compute_intersection_based_threshold_auc(
-            output["scores"],
-            output["ground_truth"],
-            0.5,
-            0.5
-        )
-        score = result["score"]
-        f_max = result["f_max"]
-
-        with open(str(exp_dir / eval_config["output_th_auc"]), "w") as writer:
-            print(f"intersection auc: {score:.2%}")
-            print(f"best f1: {f_max:.2%}")
-            print(f"intersection auc: {score:.2%}", file=writer)
-            print(f"best f1: {f_max:.2%}", file=writer)
 
 
     def train_evaluate(self,
