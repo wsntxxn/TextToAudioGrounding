@@ -1,11 +1,16 @@
 from pathlib import Path
+from warnings import warn
+import hashlib
+from collections import namedtuple
 import sklearn.preprocessing as pre
 import scipy
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import sed_eval
+from sklearn.metrics import auc
 from psds_eval import PSDSEval, plot_psd_roc
-from psds_eval.psds import WORLD
+from psds_eval.psds import WORLD, PSDSEvalError
 
 
 def find_contiguous_regions(activity_array):
@@ -37,9 +42,22 @@ def find_contiguous_regions(activity_array):
     return change_indices.reshape((-1, 2))
 
 
+def binarize(x, threshold=0.5):
+    if x.ndim == 3:
+        return np.array(
+            [pre.binarize(sub, threshold=threshold) for sub in x])
+    else:
+        return pre.binarize(x, threshold=threshold)
+
+
 def median_filter(x, window_size, threshold=0.5):
-    x = pre.binarize(x, threshold=threshold)
-    size = (window_size, 1)
+    x = binarize(x, threshold=threshold)
+    if x.ndim == 3: # (batch_size, time_steps, num_classes)
+        size = (1, window_size, 1)
+    elif x.ndim == 2 and x.shape[0] == 1: # (batch_size, time_steps)
+        size = (1, window_size)
+    elif x.ndim == 2 and x.shape[0] > 1: # (time_steps, num_classes)
+        size = (window_size, 1)
     return scipy.ndimage.median_filter(x, size=size)
 
 
@@ -123,12 +141,29 @@ def compute_psds(prediction_dfs,
                  # alpha_st=0,
                  max_efpr=400,
                  save_dir=None):
+
     if not isinstance(ground_truth, pd.DataFrame):
         ground_truth = pd.read_csv(ground_truth, sep="\t")
     if not isinstance(duration, pd.DataFrame):
         duration = pd.read_csv(duration, sep="\t")
 
-    duration = duration[duration["filename"].isin(ground_truth["filename"].unique())]
+    # duration = duration[duration["filename"].isin(ground_truth["filename"].unique())]
+
+    aid_to_dur = dict(zip(duration["audio_id"], duration["duration"]))
+
+    metadata = []
+    for _, row in ground_truth.iterrows():
+        dataid = row["filename"]
+        aid = row["audio_id"]
+        metadata.append({
+            "filename": dataid,
+            "duration": aid_to_dur[aid],
+        })
+    duration = pd.DataFrame(metadata)
+
+    if "audio_id" in ground_truth:
+        ground_truth = ground_truth.drop("audio_id", axis=1)
+
     try:
         assert set(ground_truth["filename"].values) == set(duration["filename"].values)
     except AssertionError:
@@ -172,6 +207,10 @@ def compute_psds(prediction_dfs,
                 # sep="\t",
                 # index=False,
             # )
+        
+        psds_eval.operating_points.drop(["id"], axis=1).to_csv(
+            save_dir / f"op_table_dtc{dtc_threshold}_gtc{gtc_threshold}.csv",
+            sep="\t", index=False, float_format="%.3f")
 
         plot_psd_roc(
             psds_score,
@@ -179,6 +218,40 @@ def compute_psds(prediction_dfs,
         )
 
     return psds_score.value
+
+
+def compute_th_auc(prediction_dfs,
+                   ground_truth,
+                   dtc_threshold=0.5,
+                   gtc_threshold=0.5,
+                   beta=1.,
+                   save_dir=None):
+
+    if not isinstance(ground_truth, pd.DataFrame):
+        ground_truth = pd.read_csv(ground_truth, sep="\t")
+
+    evaluator = Grounding_PrecisionRecall(dtc_threshold,
+                                          gtc_threshold,
+                                          ground_truth)
+
+    for i, k in enumerate(prediction_dfs.keys()):
+        det = prediction_dfs[k]
+        evaluator.add_operating_point(
+            det, info={"name": f"Op {i + 1:02d}", "threshold": k}
+        )
+
+    th_auc = evaluator.th_auc(beta=beta)
+
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        evaluator.operating_points.drop(["id"], axis=1).to_csv(
+            save_dir / f"op_table_dtc{dtc_threshold}_gtc{gtc_threshold}.csv",
+            sep="\t", index=False, float_format="%.3f")
+        evaluator.plot_f_threshold(save_dir / "f_vs_th.png")
+
+    return th_auc
 
 
 def get_event_list_current_file(df, fname):
@@ -274,38 +347,235 @@ def compute_sed_eval(valid_df, pred_df, t_collar=0.2, time_resolution=1.):
     return metric_event, metric_segment
 
 
-def compute_intersection_based_threshold_auc(
-        scores,
-        ground_truth,
-        dtc_threshold,
-        gtc_threshold,
-        time_decimals=6,
-        num_jobs=4
-    ):
-    from sed_scores_eval.intersection_based.intermediate_statistics import intermediate_statistics
-    from sed_scores_eval.base_modules.precision_recall import (
-        fscore_curve_from_intermediate_statistics
-    )
-    from sed_scores_eval.utils.auc import staircase_auc
-    intermediate_stats = intermediate_statistics(
-        scores=scores, ground_truth=ground_truth,
-        dtc_threshold=dtc_threshold, gtc_threshold=gtc_threshold,
-        cttc_threshold=None,
-        time_decimals=time_decimals, num_jobs=num_jobs,
-    )
-    f_curve, p_curve, r_curve, scores_curve, stats_curve = fscore_curve_from_intermediate_statistics(
-        intermediate_stats
-    )
-    f_max = f_curve["fake_event"].max()
-    score = staircase_auc(f_curve["fake_event"][:-1], scores_curve["fake_event"][:-1])
-    return {
-        "score": score,
-        "f_max": f_max,
-        "stats": {
-            "f_curve": f_curve,
-            "p_curve": p_curve,
-            "r_curve": r_curve,
-            "scores_curve": scores_curve,
-            "stats_curve": stats_curve
-        }
-    }
+Thresholds = namedtuple("Thresholds", ["gtc", "dtc"])
+
+
+class Grounding_PrecisionRecall(PSDSEval):
+
+    detection_cols = ["filename", "onset", "offset"]
+
+    def __init__(self, dtc_threshold, gtc_threshold, ground_truth):
+        if dtc_threshold < 0.0 or dtc_threshold > 1.0:
+            raise PSDSEvalError("dtc_threshold must be between 0 and 1")
+        if gtc_threshold < 0.0 or gtc_threshold > 1.0:
+            raise PSDSEvalError("gtc_threshold must be between 0 and 1")
+
+        self.class_names = []
+        self.threshold = Thresholds(dtc=dtc_threshold, gtc=gtc_threshold)
+        self.operating_points = self._operating_points_table()
+        self.ground_truth = None
+        self.metadata = None
+        self.eps = 1e-15
+        self.set_ground_truth(ground_truth)
+
+    @staticmethod
+    def _operating_points_table():
+        """Returns and empty operating point table with the correct columns"""
+        return pd.DataFrame(columns=["id", "precision", "recall", "threshold"])
+
+    def set_ground_truth(self, gt_t):
+        if self.ground_truth is not None:
+            raise PSDSEvalError("You cannot set the ground truth more than"
+                                " once per evaluation")
+        if gt_t is None:
+            raise PSDSEvalError("The ground truth cannot be set without data")
+
+        self._validate_input_table(
+            gt_t, self.detection_cols, "ground truth", allow_empty=True)
+
+        ground_truth_t = gt_t.sort_values(by=self.detection_cols[:2],
+                                          axis=0)
+        ground_truth_t.dropna(inplace=True)
+        ground_truth_t["duration"] = \
+            ground_truth_t.offset - ground_truth_t.onset
+        ground_truth_t["id"] = ground_truth_t.index
+
+        self.ground_truth = ground_truth_t
+
+    def _init_det_table(self, det_t):
+        self._validate_input_table(
+            det_t, self.detection_cols, "detection", allow_empty=True)
+        detection_t = det_t.sort_values(by=self.detection_cols[:2], axis=0)
+        detection_t["duration"] = detection_t.offset - detection_t.onset
+        detection_t["id"] = detection_t.index
+        return detection_t
+
+    def _add_op(self, recall, precision, info=None):
+        """Adds a new operating point into the class"""
+        op = {"recall": recall, "precision": precision}
+        if not info:
+            info = dict()
+
+        if set(op.keys()).isdisjoint(set(info.keys())):
+            op.update(info)
+            self.operating_points = \
+                self.operating_points.append(op, ignore_index=True)
+        else:
+            raise PSDSEvalError("the 'info' cannot contain the keys "
+                                "'recall', 'precision'")
+
+    def _operating_point_id(self, detection_table):
+        """Used to produce a unique ID for each operating point
+
+        here we sort the dataframe so that shuffled versions of the same
+        detection table results in the same hash
+        """
+
+        table_columns = ["filename", "onset", "offset"]
+        detection_table_col_sorted = detection_table[
+            table_columns]
+        detection_table_row_sorted = detection_table_col_sorted.sort_values(
+            by=table_columns)
+        h = hashlib.sha256(pd.util.hash_pandas_object(
+            detection_table_row_sorted, index=False).values)
+        uid = h.hexdigest()
+        if uid in self.operating_points.id.values:
+            warn("A similar operating point exists, skipping this one")
+            uid = ""
+        return uid
+
+    def add_operating_point(self, detections, info=None):
+        if self.ground_truth is None:
+            raise PSDSEvalError("Ground Truth must be provided before "
+                                "adding the first operating point")
+
+        # validate and prepare tables
+        det_t = self._init_det_table(detections)
+        op_id = self._operating_point_id(det_t)
+        info["id"] = op_id
+        if not op_id:
+            threshold = info["threshold"]
+            last_row = self.operating_points.iloc[-1].to_dict()
+            last_row["threshold"] = threshold
+            self.operating_points = self.operating_points.append(
+                last_row, ignore_index=True)
+            return
+
+        precision, recall = self._evaluate_detections(det_t)
+        self._add_op(recall=recall, precision=precision, info=info)
+
+
+    @staticmethod
+    def _ground_truth_intersections(detection_t, ground_truth_t):
+        comb_t = pd.merge(detection_t, ground_truth_t,
+                          how='outer', on='filename',
+                          suffixes=("_det", "_gt"))
+        # cross_t contains detections that intersect one or more ground truths
+        cross_t = comb_t[(comb_t.onset_det <= comb_t.offset_gt) &
+                         (comb_t.onset_gt <= comb_t.offset_det) &
+                         comb_t.filename.notna()].copy(deep=True)
+
+        cross_t["inter_duration"] = \
+            np.minimum(cross_t.offset_det, cross_t.offset_gt) - \
+            np.maximum(cross_t.onset_det, cross_t.onset_gt)
+        cross_t["det_precision"] = \
+            cross_t.inter_duration / cross_t.duration_det
+        cross_t["gt_coverage"] = \
+            cross_t.inter_duration / cross_t.duration_gt
+        return cross_t
+
+    def _recall_criteria(self, cross_t):
+        # Group the duplicate detections and sum the det_precision
+        if cross_t.empty:
+            dtc_t = pd.DataFrame(columns=["id_det",
+                                          "det_precision"])
+        else:
+            dtc_t = cross_t.groupby(
+                ["id_det"]
+            ).det_precision.sum().reset_index()
+
+        # when calculating gt_coverage_sum, only count detection that satisfies dtc requirement
+        dtc_ids = dtc_t[dtc_t.det_precision >= self.threshold.dtc].id_det
+
+        # Group the duplicate detections that exist in the DTC set and sum
+        gtc_t = cross_t[cross_t.id_det.isin(dtc_ids)].groupby(
+            ["id_gt"]
+        ).gt_coverage.sum().reset_index()
+
+        # Join the two into a single true positive table
+        if len(dtc_t) or len(gtc_t):
+            tmp = pd.merge(cross_t, dtc_t, on=["id_det"],
+                           suffixes=("", "_sum")
+                           ).merge(gtc_t, on=["id_gt"],
+                                   suffixes=("", "_sum"))
+        else:
+            cols = cross_t.columns.to_list() + \
+                   ["det_precision_sum", "gt_coverage_sum"]
+            tmp = pd.DataFrame(columns=cols)
+
+        gtc_filter = tmp.gt_coverage_sum >= self.threshold.gtc
+
+        num_tp_refs = tmp[gtc_filter].id_gt.unique().shape[0]
+        return num_tp_refs
+
+
+    def _precision_criteria(self, cross_t):
+        # Group the duplicate detections and sum the det_precision
+        if cross_t.empty:
+            gtc_t = pd.DataFrame(columns=["id_gt", 
+                                          "gt_coverage"])
+        else:
+            gtc_t = cross_t.groupby(
+                ["id_gt"]
+            ).gt_coverage.sum().reset_index()
+
+        # when calculating det_precision_sum, only count ground truth that satisfies gtc requirement
+        gtc_ids = gtc_t[gtc_t.gt_coverage >= self.threshold.gtc].id_gt
+
+        # Group the duplicate detections that exist in the DTC set and sum
+        dtc_t = cross_t[cross_t.id_gt.isin(gtc_ids)].groupby(
+            ["id_det"]
+        ).det_precision.sum().reset_index()
+
+        # Join the two into a single true positive table
+        if len(dtc_t) or len(gtc_t):
+            tmp = pd.merge(cross_t, gtc_t, on=["id_gt"],
+                           suffixes=("", "_sum")
+                           ).merge(dtc_t, on=["id_det"],
+                                   suffixes=("", "_sum"))
+        else:
+            cols = cross_t.columns.to_list() + \
+                   ["det_precision_sum", "gt_coverage_sum"]
+            tmp = pd.DataFrame(columns=cols)
+
+        dtc_filter = tmp.det_precision_sum >= self.threshold.dtc
+
+        num_tp_preds = tmp[dtc_filter].id_det.unique().shape[0]
+        return num_tp_preds
+
+    def _evaluate_detections(self, det_t):
+        inter_t = self._ground_truth_intersections(det_t, self.ground_truth)
+        num_tp_refs = self._recall_criteria(inter_t)
+        num_tp_preds = self._precision_criteria(inter_t)
+        num_refs = self.ground_truth.shape[0]
+        num_preds = det_t.shape[0]
+
+        recall = num_tp_refs / np.maximum(num_refs, self.eps)
+        precision = num_tp_preds / np.maximum(num_preds, self.eps)
+
+        return precision, recall
+
+    def th_auc(self, beta=1., low_th=0., high_th=1.):
+        precision = self.operating_points.precision
+        recall = self.operating_points.recall
+        self.operating_points["f_score"] = ((1 + beta**2) * precision * recall) \
+            / np.maximum(beta**2 * precision + recall, self.eps)
+
+        sub_table = self.operating_points[
+            (self.operating_points.threshold >= low_th) & 
+            (self.operating_points.threshold <= high_th)]
+        sort_idxs = np.argsort(sub_table.threshold.values)
+        return auc(sub_table.threshold.values[sort_idxs],
+                   sub_table.f_score.values[sort_idxs])
+
+    def plot_f_threshold(self, fig_path):
+        sort_idxs = np.argsort(self.operating_points.threshold.values)
+        ths = self.operating_points.threshold.values[sort_idxs]
+        fs = self.operating_points.f_score.values[sort_idxs]
+        plt.figure(figsize=(14, 5))
+        plt.plot(ths, fs)
+        plt.ylim(0., 1.)
+        plt.xlabel("threshold")
+        plt.ylabel("f_score")
+        plt.savefig(fig_path, dpi=150, bbox_inches="tight")
+        

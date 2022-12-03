@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.utils import init_weights, linear_softmax_with_lens, max_with_lens
+from utils.train_util import do_mixup
 
 
 class GroundingModel(nn.Module):
@@ -77,318 +78,6 @@ class BiEncoder(GroundingModel):
         }
 
 
-class AudioTextAlign(nn.Module):
-
-    def __init__(self,
-                 audio_encoder,
-                 text_encoder,
-                 match_fn,
-                 pooling,
-                 shared_dim,
-                 add_proj=False,
-                 freeze_audio_encoder=False,
-                 freeze_text_encoder=False
-                 ):
-        super().__init__()
-        self.audio_encoder = audio_encoder
-        self.text_encoder = text_encoder
-        self.match_fn = match_fn
-        self.pooling = pooling
-        if audio_encoder.embed_dim != text_encoder.embed_dim or add_proj:
-            self.audio_proj = nn.Linear(audio_encoder.embed_dim, shared_dim)
-            self.text_proj = nn.Linear(text_encoder.embed_dim, shared_dim)
-        if freeze_audio_encoder:
-            for param in self.audio_encoder.parameters():
-                param.requires_grad = False
-        if freeze_text_encoder:
-            for param in self.text_encoder.parameters():
-                param.requires_grad = False
-
-    def forward(self, input_dict):
-        """
-        keys in input_dict:
-            waveform, waveform_len,
-            text, text_len,
-            pool (True/False)
-        """
-        audio_output = self.audio_encoder(input_dict)
-        if hasattr(self, "audio_proj"):
-            audio_emb = self.audio_proj(audio_output["embedding"])
-        else:
-            audio_emb = audio_output["embedding"]
-        # audio_emb: [bs, n_seg, emb_dim]
-        text_emb = self.text_encoder(input_dict)
-        # word_emb: [bs, n_word, emb_dim]
-        if hasattr(self, "text_proj"):
-            text_emb = self.text_proj(text_emb)
-        sim = self.match_fn(audio_emb, text_emb)
-        # sim: [bs, bs, n_seg, n_word]
-        pool = input_dict.get("pool", True)
-        if pool:
-            sim = self.pooling({
-                "sim": sim,
-                "audio_len": audio_output["length"],
-                "text_len": input_dict["text_len"]
-            })
-        return {
-            "sim": sim,
-        }
-
-
-class VectorQuantizer(nn.Module):
-    """
-    see https://github.com/MishaLaskin/vqvae/blob/d761a999e2267766400dc646d82d3ac3657771d4/models/quantizer.py
-    ____________________________________________
-    Inputs:
-    - n_e : number of embeddings
-    - e_dim : dimension of embedding
-    - beta : commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
-    _____________________________________________
-    """
-
-    def __init__(self, n_e, e_dim, beta):
-        super().__init__()
-        self.n_e = n_e
-        self.e_dim = e_dim
-        self.beta = beta
-
-        self.embedding = nn.Embedding(self.n_e, self.e_dim)
-        self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
-
-    def forward(self, z):
-        """
-        Inputs the output of the encoder network z and maps it to a discrete
-        one-hot vector that is the index of the closest embedding vector e_j
-        z (continuous) -> z_q (discrete)
-        2d: z.shape = (batch, channel, height, width)
-        1d: z.shape = (batch, channel, time)
-        quantization pipeline:
-            1. get encoder input 2d: (B,C,H,W) or 1d: (B, C, T)
-            2. flatten input to 2d: (B*H*W,C) or 1d: (B*T, C)
-        """
-        # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
-        
-        d = torch.sum(z ** 2, dim=1, keepdim=True) + \
-            torch.sum(self.embedding.weight ** 2, dim=1) - 2 * \
-            torch.matmul(z, self.embedding.weight.t())
-
-        # find closest encodings
-        min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
-
-        min_encodings = torch.zeros(min_encoding_indices.shape[0], self.n_e).to(z)
-        min_encodings.scatter_(1, min_encoding_indices, 1)
-
-        # get quantized latent vectors
-        z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
-
-        # compute loss for embedding
-        loss = torch.mean((z.detach() - z_q) ** 2) + \
-            self.beta * torch.mean((z - z_q.detach()) ** 2)
-
-        # preserve gradients
-        z_q = z + (z_q - z).detach()
-
-        # perplexity
-        # e_mean = torch.mean(min_encodings, dim=0)
-        # perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
-
-        return {
-            "emb": z_q,
-            "loss": loss
-        }
-
-    def get_codebook_entry(self, indices):
-        min_encodings = torch.zeros(indices.shape[0], self.n_e).to(indices)
-        min_encodings.scatter_(1, indices[:, None], 1)
-
-        # get quantized latent vectors
-        z_q = torch.matmul(min_encodings.float(), self.embedding.weight)
-
-        return z_q
-
-
-class AudioMultiText(AudioTextAlign):
-
-    def __init__(self, audio_encoder, text_encoder, match_fn, pooling,
-                 shared_dim, quantize=True, codebook_size=300, add_proj=False,
-                 freeze_audio_encoder=False, freeze_text_encoder=False):
-        super().__init__(audio_encoder, text_encoder, match_fn, pooling,
-                         shared_dim, add_proj=add_proj,
-                         freeze_audio_encoder=freeze_audio_encoder,
-                         freeze_text_encoder=freeze_text_encoder)
-        self.quantize = quantize
-        if quantize:
-            self.vq = VectorQuantizer(codebook_size,
-                                      self.text_encoder.embed_dim,
-                                      0.25)
-
-    def forward(self, input_dict):
-        audio_output = self.audio_encoder(input_dict)
-        if hasattr(self, "audio_proj"):
-            audio_emb = self.audio_proj(audio_output["embedding"])
-        else:
-            audio_emb = audio_output["embedding"]
-        # audio_emb: [bs, n_seg, emb_dim]
-        if isinstance(input_dict["text"], torch.Tensor):
-            batch_size, txt_num, max_txt_len = input_dict["text"].size()
-            forward_dict = {}
-            forward_dict["text"] = input_dict["text"].reshape(-1, max_txt_len)
-            forward_dict["text_len"] = input_dict["text_len"].reshape(-1)
-            text_emb = self.text_encoder(forward_dict)
-        elif isinstance(input_dict["text"], list):
-            batch_size = len(input_dict["text"])
-            txt_num = len(input_dict["text"][0])
-            text = sum(input_dict["text"], [])
-            text_emb = self.text_encoder(text)["sentence_emb"]
-        # text_emb: [bs, txt_num, emb_dim]
-        if self.quantize:
-            vq_out = self.vq(text_emb)
-            text_emb = vq_out["emb"]
-            vq_loss = vq_out["loss"]
-        if hasattr(self, "text_proj"):
-            text_emb = self.text_proj(text_emb)
-        text_emb = text_emb.reshape(batch_size, txt_num, -1)
-        sim = self.match_fn(audio_emb, text_emb)
-        # sim: [bs, txt_num, n_seg]
-        clip_sim = self.pooling({
-            "sim": sim,
-            "audio_len": audio_output["length"]
-        })
-        output = {
-            "frame_sim": sim,
-            "clip_sim": clip_sim
-        }
-        if self.quantize:
-            output["vq_loss"] = vq_loss
-        return output
-
-
-class TaggingQuantizer(nn.Module):
-
-    def __init__(self, n_e, e_dim, beta,
-                 distance_measure="cosine", pretrained_weight=None,
-                 freeze_weight=False, threshold=None):
-        super().__init__()
-        self.n_e = n_e
-        self.e_dim = e_dim
-        self.beta = beta
-        self.distance_measure = distance_measure
-        self.threshold = threshold
-
-        if pretrained_weight is None:
-            self.embedding = nn.Embedding(self.n_e, self.e_dim)
-            self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
-        else:
-            weight = np.load(pretrained_weight)
-            weight = torch.as_tensor(weight, dtype=torch.float)
-            self.embedding = nn.Embedding.from_pretrained(weight, freeze_weight)
-
-    def forward(self, z):
-
-        if self.distance_measure == "l2":
-            d = torch.sum(z ** 2, dim=1, keepdim=True) + \
-                torch.sum(self.embedding.weight ** 2, dim=1) - 2 * \
-                torch.matmul(z, self.embedding.weight.t())
-        elif self.distance_measure == "cosine":
-            d = -F.normalize(z, dim=-1) @ F.normalize(self.embedding.weight, dim=-1).transpose(0, 1)
-        
-        # find closest encodings
-        min_encoding_indices = torch.argmin(d, dim=1)
-        
-        z_q = self.embedding(min_encoding_indices)
-
-        # compute loss for embedding
-        loss = torch.mean((z.detach() - z_q) ** 2) + \
-            self.beta * torch.mean((z - z_q.detach()) ** 2)
-
-        if self.threshold is not None:
-            sim = -d
-            pos_indices = torch.where(sim > self.threshold)[1].unique()
-        else:
-            pos_indices = min_encoding_indices.unique()
-
-        z_q = self.embedding(pos_indices)
-        
-        neg_indices = np.delete(np.arange(self.n_e), pos_indices.cpu().numpy())
-        neg_indices = torch.as_tensor(neg_indices).to(z_q).long()
-        z_q_neg = self.embedding(neg_indices)
-        label = torch.as_tensor([1] * pos_indices.shape[0] + [0] * neg_indices.shape[0])
-        label = label.to(z_q)
-        z_q = torch.cat((z_q, z_q_neg))
-
-        return {
-            "emb": z_q,
-            "label": label,
-            "loss": loss
-        }
-
-
-class AudioTextTagging(nn.Module):
-
-    def __init__(self, audio_encoder, text_encoder, match_fn, pooling,
-                 shared_dim, codebook_embed_dim, codebook_size=300,
-                 add_proj=False, freeze_audio_encoder=False,
-                 freeze_text_encoder=False, distance_measure="cosine",
-                 pretrained_quantize_weight=None, freeze_quantize_weight=False,
-                 quantize_threshold=None):
-        super().__init__()
-        self.audio_encoder = audio_encoder
-        self.text_encoder = text_encoder
-        self.match_fn = match_fn
-        self.pooling = pooling
-        self.quantize = True
-        self.vq = TaggingQuantizer(codebook_size, codebook_embed_dim, 0.25,
-                                   distance_measure, pretrained_quantize_weight,
-                                   freeze_quantize_weight, quantize_threshold)
-        if audio_encoder.embed_dim != text_encoder.embed_dim or add_proj:
-            self.audio_proj = nn.Linear(audio_encoder.embed_dim, shared_dim)
-            self.text_proj = nn.Linear(text_encoder.embed_dim, shared_dim)
-        if freeze_audio_encoder:
-            for param in self.audio_encoder.parameters():
-                param.requires_grad = False
-        if freeze_text_encoder:
-            for param in self.text_encoder.parameters():
-                param.requires_grad = False
-
-    def forward(self, input_dict):
-        audio_output = self.audio_encoder(input_dict)
-        if hasattr(self, "audio_proj"):
-            audio_emb = self.audio_proj(audio_output["embedding"])
-        else:
-            audio_emb = audio_output["embedding"]
-        # audio_emb: [bs, n_seg, emb_dim]
-        batch_size = len(input_dict["text"])
-        txt_num = input_dict["text_num"]
-        text = sum(input_dict["text"], [])
-        text_emb = self.text_encoder(text)
-        text_embs = torch.split(text_emb, txt_num, dim=0)
-        vq_loss = 0
-        labels = []
-        vq_embs = []
-        for text_emb in text_embs:
-            vq_out = self.vq(text_emb)
-            vq_embs.append(vq_out["emb"])
-            vq_loss += vq_out["loss"]
-            labels.append(vq_out["label"])
-        vq_loss = vq_loss / len(text_embs)
-        label = torch.stack(labels)
-        vq_emb = torch.stack(vq_embs)
-        if hasattr(self, "text_proj"):
-            vq_emb = self.text_proj(vq_emb)
-        prob = self.match_fn(audio_emb, vq_emb)
-        # prob: [bs, q_num, n_seg]
-        clip_prob = self.pooling({
-            "sim": prob, "audio_len": audio_output["length"]
-        })
-        output = {
-            "frame_sim": prob,
-            "clip_sim": clip_prob,
-            "vq_loss": vq_loss,
-            "label": label
-        }
-        return output
-
-
 class AudioTagging(nn.Module):
 
     def __init__(self, audio_encoder, classes_num, pooling="linear_softmax"):
@@ -429,79 +118,12 @@ class AudioTagging(nn.Module):
             clip_prob = linear_softmax_with_lens(prob, output["length"])
         elif self.pooling == "max":
             clip_prob = max_with_lens(prob, output["length"])
+        else:
+            raise Exception(f"Unsupported pooling {self.pooling}")
         return {
             "frame_sim": prob,
             "clip_sim": clip_prob,
             "length": output["length"]
-        }
-
-
-class AudioTaggingWithText(nn.Module):
-
-    def __init__(self, audio_encoder, text_encoder, classes_num,
-                 freeze_audio_encoder=False, freeze_text_encoder=False) -> None:
-        super().__init__()
-        self.backbone = audio_encoder
-        self.text_encoder = text_encoder
-        self.fc_output = nn.Linear(
-            audio_encoder.embed_dim + text_encoder.embed_dim,
-            classes_num)
-        if freeze_audio_encoder:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-        if freeze_text_encoder:
-            for param in self.text_encoder.parameters():
-                param.requires_grad = False
-
-    def forward(self, input_dict):
-        output = self.backbone(input_dict)
-        text_emb = self.text_encoder(input_dict["text"])["sentence_emb"]
-        audio_emb = output["embedding"]
-        emb = torch.cat((audio_emb, text_emb.unsqueeze(1).expand_as(audio_emb)), dim=-1)
-        logit = self.fc_output(emb)
-        prob = torch.sigmoid(logit)
-        clip_prob = linear_softmax_with_lens(prob, output["length"])
-        return {
-            "frame_sim": prob,
-            "clip_sim": clip_prob
-        }
-
-
-class AudioTaggingWithTextCrossAttn(nn.Module):
-
-    def __init__(self, audio_encoder, text_encoder, classes_num,
-                 num_heads=8, dropout=0.2,
-                 freeze_audio_encoder=False, freeze_text_encoder=False) -> None:
-        super().__init__()
-        self.backbone = audio_encoder
-        self.text_encoder = text_encoder
-        embed_dim = audio_encoder.embed_dim
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads,
-            dropout, batch_first=True)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(embed_dim)
-        self.fc_output = nn.Linear(embed_dim, classes_num)
-        if freeze_audio_encoder:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-        if freeze_text_encoder:
-            for param in self.text_encoder.parameters():
-                param.requires_grad = False
-
-    def forward(self, input_dict):
-        audio_output = self.backbone(input_dict)
-        text_output = self.text_encoder(input_dict["text"])
-        audio_emb = audio_output["embedding"]
-        padding_mask = ~text_output["attention_mask"]
-        text_emb = text_output["token_emb"]
-        emb, attn = self.attn(audio_emb, text_emb, text_emb, key_padding_mask=padding_mask)
-        emb = self.norm(audio_emb + self.dropout(emb))
-        logit = self.fc_output(emb)
-        prob = torch.sigmoid(logit)
-        clip_prob = linear_softmax_with_lens(prob, audio_output["length"])
-        return {
-            "frame_sim": prob,
-            "clip_sim": clip_prob
         }
 
 
@@ -610,6 +232,256 @@ class CrossCrnn(nn.Module):
         }
 
 
+class ConvTextBlock(nn.Module):
+
+    def __init__(self, in_channels, out_channels, text_emb_dim):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_channels,
+                               out_channels=out_channels,
+                               kernel_size=(3, 3), stride=(1, 1),
+                               padding=(1, 1), bias=False)
+                              
+        self.conv2 = nn.Conv2d(in_channels=out_channels,
+                               out_channels=out_channels,
+                               kernel_size=(3, 3), stride=(1, 1),
+                               padding=(1, 1), bias=False)
+                              
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.fc_text = nn.Linear(text_emb_dim, out_channels)
+
+        self.init_weight()
+
+    def init_layer(self, layer):
+        """Initialize a Linear or Convolutional layer. """
+        nn.init.xavier_uniform_(layer.weight)
+     
+        if hasattr(layer, 'bias'):
+            if layer.bias is not None:
+                layer.bias.data.fill_(0.)
+        
+    def init_bn(self, bn):
+        """Initialize a Batchnorm layer. """
+        bn.bias.data.fill_(0.)
+        bn.weight.data.fill_(1.)
+
+    def init_weight(self):
+        self.init_layer(self.conv1)
+        self.init_layer(self.conv2)
+        self.init_layer(self.fc_text)
+        self.init_bn(self.bn1)
+        self.init_bn(self.bn2)
+        
+    def forward(self, audio, text, pool_size=(2, 2), pool_type='avg'):
+        # audio: [batch_size, n_channel, time_steps, n_freq] 
+        # text: [batch_size, n_channel]
+        x = audio
+        text = self.fc_text(text)
+        x = F.relu_(self.bn1(self.conv1(x)) + text.unsqueeze(-1).unsqueeze(-1))
+        x = F.relu_(self.bn2(self.conv2(x)) + text.unsqueeze(-1).unsqueeze(-1))
+        if pool_type == 'max':
+            x = F.max_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg':
+            x = F.avg_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg+max':
+            x1 = F.avg_pool2d(x, kernel_size=pool_size)
+            x2 = F.max_pool2d(x, kernel_size=pool_size)
+            x = x1 + x2
+        else:
+            raise Exception('Incorrect argument!')
+        
+        return x
+
+
+class CrossCnn8_Rnn(nn.Module):
+
+    def __init__(self, sample_rate, text_encoder, freeze_cnn=False,
+                 freeze_bn=False, upsample=False) -> None:
+        from torchaudio import transforms
+        from torchlibrosa import SpecAugmentation
+        super().__init__()
+        self.text_encoder = text_encoder
+
+        self.interpolate_ratio = 4
+        self.upsample = upsample
+        self.freeze_cnn = freeze_cnn
+        self.freeze_bn = freeze_bn
+
+        # Logmel spectrogram extractor
+        self.hop_length = int(0.010 * sample_rate)
+        self.win_length = int(0.032 * sample_rate)
+        if sample_rate == 32000:
+            f_max = 14000
+        else:
+            f_max = int(sample_rate / 2)
+        self.melspec_extractor = transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=self.win_length,
+            win_length=self.win_length,
+            hop_length=self.hop_length,
+            f_min=50,
+            f_max=f_max,
+            n_mels=64,
+            norm="slaney",
+            mel_scale="slaney"
+        )
+        self.db_transform = transforms.AmplitudeToDB()
+        # Spec augmenter
+        self.spec_augmenter = SpecAugmentation(
+            time_drop_width=64, time_stripes_num=2,
+            freq_drop_width=8, freq_stripes_num=2)
+
+        self.text_emb_dim = text_encoder.embed_dim
+
+        self.bn0 = nn.BatchNorm2d(64)
+
+        self.conv_block1 = ConvTextBlock(1, 64, self.text_emb_dim)
+        self.conv_block2 = ConvTextBlock(64, 128, self.text_emb_dim)
+        self.conv_block3 = ConvTextBlock(128, 256, self.text_emb_dim)
+        self.conv_block4 = ConvTextBlock(256, 512, self.text_emb_dim)
+
+        self.fc1 = nn.Linear(512, 512, bias=True)
+        self.fc1_text = nn.Linear(self.text_emb_dim, 512)
+        self.rnn = nn.GRU(512, 256, bidirectional=True, batch_first=True)
+        self.rnn_text = nn.Linear(self.text_emb_dim, 512)
+
+        self.fc_output = nn.Linear(512, 1)
+        
+        self.init_weight()
+
+        if self.freeze_cnn:
+            for param in self.parameters():
+                param.requires_grad = False
+            for param in self.rnn.parameters():
+                param.requires_grad = True
+
+    def load_pretrained(self, pretrained, output_fn, training=True, cnn_only=False):
+        if isinstance(pretrained, dict):
+            state_dict = pretrained
+        else:
+            state_dict = torch.load(pretrained, map_location="cpu")
+
+        if "model" in state_dict:
+            state_dict = state_dict["model"]
+
+        model_dict = self.state_dict()
+        pretrained_dict = {
+            k: v for k, v in state_dict.items() if (k in model_dict) and (
+                model_dict[k].shape == v.shape)
+        }
+        if cnn_only and training:
+            filtered_dict = {}
+            for k, v in pretrained_dict.items():
+                if k.startswith("rnn") or k.startswith("fc1") \
+                    or k.startswith("fc_output"):
+                    continue
+                filtered_dict[k] = v
+            pretrained_dict = filtered_dict
+        output_fn(f"Loading pretrained keys {pretrained_dict.keys()}")
+        model_dict.update(pretrained_dict)
+        self.load_state_dict(model_dict, strict=True)
+
+    def train(self, mode: bool = True):
+        super().train(mode=mode)
+        if self.freeze_bn:
+            def bn_eval(module):
+                class_name = module.__class__.__name__
+                if class_name.find("BatchNorm") != -1:
+                    module.eval()
+            self.apply(bn_eval)
+        return self
+
+    def init_layer(self, layer):
+        """Initialize a Linear or Convolutional layer. """
+        nn.init.xavier_uniform_(layer.weight)
+     
+        if hasattr(layer, 'bias'):
+            if layer.bias is not None:
+                layer.bias.data.fill_(0.)
+        
+    def init_bn(self, bn):
+        """Initialize a Batchnorm layer. """
+        bn.bias.data.fill_(0.)
+        bn.weight.data.fill_(1.)
+
+    def init_weight(self):
+        self.init_bn(self.bn0)
+        self.init_layer(self.fc1)
+        self.init_layer(self.fc1_text)
+        self.init_layer(self.rnn_text)
+        self.init_layer(self.fc_output)
+
+    def forward_cnn(self, audio, text):
+        x = self.conv_block1(audio, text, pool_size=(2, 2), pool_type='avg+max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block2(x, text, pool_size=(2, 2), pool_type='avg+max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block3(x, text, pool_size=(1, 2), pool_type='avg+max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv_block4(x, text, pool_size=(1, 2), pool_type='avg+max')
+        x = F.dropout(x, p=0.2, training=self.training) # (batch_size, 512, time_steps / 4, mel_bins / 16)
+        return x
+
+    def forward(self, input_dict):
+        text_emb = self.text_encoder(input_dict)
+        waveform = input_dict["waveform"]
+        
+        x = self.melspec_extractor(waveform)
+        x = self.db_transform(x)    # (batch_size, mel_bins, time_steps)
+        x = x.transpose(1, 2)
+        x = x.unsqueeze(1)
+
+        x = x.transpose(1, 3)
+        x = self.bn0(x)
+        x = x.transpose(1, 3)
+
+        specaug = input_dict["specaug"]
+        # SpecAugment
+        if self.training and specaug:
+            x = self.spec_augmenter(x)
+
+        mixup_lambda = input_dict.get("mixup_lambda", None)
+        # Mixup on spectrogram
+        if self.training and mixup_lambda is not None:
+            x = do_mixup(x, mixup_lambda)
+
+        x = self.forward_cnn(x, text_emb)
+        x = torch.mean(x, dim=3) # (batch_size, 512, time_steps / 4)
+
+        x = x.transpose(1, 2)
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu_(self.fc1(x) + self.fc1_text(text_emb).unsqueeze(1))
+
+        x, _  = self.rnn(x)
+        x = x + self.rnn_text(text_emb).unsqueeze(1)
+    
+        logit = self.fc_output(x)
+        prob = torch.sigmoid(logit).clamp(1e-7, 1.)
+
+        length = torch.div(
+            torch.as_tensor(input_dict["waveform_len"]),
+            self.hop_length,
+            rounding_mode="floor") + 1
+
+        length = torch.div(length, self.interpolate_ratio, rounding_mode="floor")
+
+        if self.interpolate_ratio != 1 and self.upsample:
+            prob = F.interpolate(
+                prob.transpose(1, 2),
+                prob.size(1) * self.interpolate_ratio,
+                mode="linear",
+                align_corners=False
+            ).transpose(1, 2)
+            length = length * self.interpolate_ratio
+
+        return {
+            "prob": prob,
+            "length": length
+        }
+
+
+
+
 if __name__ == "__main__":
     import sys
     import os
@@ -618,10 +490,11 @@ if __name__ == "__main__":
     from models.text_encoder import EmbeddingMeanEncoder
     from models.match import ExpNegL2
     vocab_size = 1500
-    audio_encoder = CrnnEncoder(32000, 256)
+    # audio_encoder = CrnnEncoder(32000, 256)
     text_encoder = EmbeddingMeanEncoder(vocab_size, 256)
-    match_fn = ExpNegL2()
-    model = BiEncoder(audio_encoder, text_encoder, match_fn, 256, True)
+    # match_fn = ExpNegL2()
+    # model = BiEncoder(audio_encoder, text_encoder, match_fn, 256, True)
+    model = CrossCnn8_Rnn(32000, text_encoder)
     print(model)
     input_dict = {
         "waveform": torch.randn(4, 320000),

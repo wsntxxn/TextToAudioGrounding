@@ -195,6 +195,8 @@ class Cnn8_Rnn(nn.Module):
             self.hop_length,
             rounding_mode="floor") + 1
 
+        length = torch.div(length, self.downsample_ratio, rounding_mode="floor")
+
         if self.training and mixup_lambda is not None:
             length = do_mixup(length, mixup_lambda)
     

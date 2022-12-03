@@ -12,6 +12,8 @@ class FrameBceLoss(nn.Module):
 
     def forward(self, output: Dict):
         prob = output["prob"] # [N, T]
+        if prob.ndim == 3 and prob.size(2) == 1:
+            prob = prob.squeeze(2)
         length = output["length"] # [N]
         label = output["label"] # [N, T]
         # truncated_length = min(prob.size(1), label.size(1))

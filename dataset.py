@@ -407,7 +407,6 @@ class AudioTaggingRawTextDataset(Dataset):
                  waveform: str,
                  label: str,
                  audioset_label: str,
-                 # phrase_indice: str,
                  phrase_embed: str,
                  as_label_embed: str,
                  label_encoder: str,
@@ -425,11 +424,6 @@ class AudioTaggingRawTextDataset(Dataset):
         self.classes_num = len(self.label_encoder.classes_)
         self.label_to_idx = { lbl: idx for idx, lbl in enumerate(
             self.label_encoder.classes_) }
-        # self.min_sim = min_sim
-        # self.phrase_to_idx = load_dict_from_csv(phrase_indice,
-                                                # ("phrase", "index"))
-        # self.phrase_to_sim = load_dict_from_csv(phrase_indice,
-                                                # ("phrase", "sim"))
         self.phrase_to_emb = pickle.load(open(phrase_embed, "rb"))
         self.label_to_emb = pickle.load(open(as_label_embed, "rb"))
         self.label_embs = []
@@ -442,6 +436,8 @@ class AudioTaggingRawTextDataset(Dataset):
 
     def assign_phrase_label(self, phrase_emb, label_onehot):
         sim = cosine_similarity(phrase_emb.reshape(1, -1), self.label_embs)[0]
+        if sim.max() < self.thresholds[0] or sim.min() > self.thresholds[1]:
+            return
         sim[np.where((sim < self.thresholds[0]) | 
                      (sim > self.thresholds[1]))[0]] = 0
         if self.topk > 0:
@@ -480,15 +476,21 @@ class AudioTaggingRawTextDataset(Dataset):
 
 class AudioTaggingTestRawTextDataset(Dataset):
 
+
     def __init__(self,
                  waveform: str,
                  label: str,
-                 phrase_indice: str) -> None:
+                 phrase_embed: str,
+                 as_label_embed: str,) -> None:
         self.aid_to_h5 = load_dict_from_csv(waveform, ("audio_id", "hdf5_path"))
         self.cache = {}
         self.data = json.load(open(label))
-        self.phrase_to_idx = load_dict_from_csv(phrase_indice,
-                                                ("phrase", "index"))
+        self.phrase_to_emb = pickle.load(open(phrase_embed, "rb"))
+        self.label_to_emb = pickle.load(open(as_label_embed, "rb"))
+        self.label_embs = []
+        for lbl, emb in self.label_to_emb.items():
+            self.label_embs.append(emb)
+        self.label_embs = np.stack(self.label_embs)
         self.generate_index()
 
 
@@ -508,14 +510,16 @@ class AudioTaggingTestRawTextDataset(Dataset):
         waveform = read_from_h5(audio_id, self.aid_to_h5, self.cache)
         waveform = np.array(waveform, dtype=np.float32)
         text = phrase_item["phrase"]
-        text_idx = self.phrase_to_idx[text]
+        emb = self.phrase_to_emb[text]
+        sim = cosine_similarity(emb.reshape(1, -1), self.label_embs)
+        indice = sim[0].argmax()
         return {
             "audiocap_id": audio_item["audiocap_id"],
             "start_index": phrase_item["start_index"],
             "end_index": phrase_item["end_index"],
             "waveform": waveform,
             "text": caption,
-            "text_idx": text_idx
+            "text_idx": indice
         }
 
     def __len__(self):
@@ -944,23 +948,32 @@ class TaggingRawTextCollate(CollateFunction):
 if __name__ == "__main__":
     import argparse
     from tqdm import tqdm
+    from scipy import sparse
+    from utils.train_util import load_config, init_obj_from_str
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--waveform", default="data/train/waveform.csv", type=str)
-    parser.add_argument("--label", default="data/train/label.json", type=str)
-    parser.add_argument("--vocabulary", default="data/train/vocab.pkl", type=str)
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--output", type=str, required=True)
     args = parser.parse_args()
 
-    dataset = TrainDataset(args.waveform, args.label, args.vocabulary)
-
+    config_file = args.config
+    config = load_config(config_file)["data"]["train"]
+    dataset = init_obj_from_str(config["dataset"])
+    collate_fn = init_obj_from_str(config["collate_fn"])
+    kwargs = {
+        "collate_fn": collate_fn,
+        "shuffle": False
+    }
+    kwargs.update(config["dataloader_args"])
     dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=8,
-        collate_fn=CollateFunction(["waveform", "text", "label"]),
-        num_workers=4,
-        shuffle=True)
+        dataset, **kwargs)
 
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    labels = []
     with tqdm(total=len(dataloader), ncols=100, ascii=True, unit="batch") as pbar:
         for batch in dataloader:
-            import ipdb; ipdb.set_trace()
+            labels.append(batch["label"].numpy())
             pbar.update()
+    
+    labels = np.concatenate(labels)
+    sparse.save_npz(args.output, sparse.csr_matrix(labels))
