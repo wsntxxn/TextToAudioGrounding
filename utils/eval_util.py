@@ -11,6 +11,7 @@ import sed_eval
 from sklearn.metrics import auc
 from psds_eval import PSDSEval, plot_psd_roc
 from psds_eval.psds import WORLD, PSDSEvalError
+from sed_scores_eval import intersection_based
 
 
 def find_contiguous_regions(activity_array):
@@ -114,21 +115,21 @@ def connect_(pairs, n=1):
     return new_pairs
 
 
-class PSDSEval_Grounding(PSDSEval):
+# class PSDSEval_Grounding(PSDSEval):
 
-    def _get_dataset_duration(self):
-        """Compute duraion of on the source data.
+    # def _get_dataset_duration(self):
+        # """Compute duraion of on the source data.
 
-        Compute the duration per class, and total duration for false
-        positives."""
-        t_filter = self.ground_truth.event_label == WORLD
-        if not hasattr(self, "data_duration"):
-            gt = self.ground_truth[t_filter].copy()
-            gt["audio_id"] = gt["filename"].apply(lambda x: x.split("_")[0]).values
-            data_duration = gt.groupby("audio_id")["duration"].apply(lambda x: list(x)[0]).sum()
-            self.data_duration = data_duration
-        gt_durations = self.ground_truth.groupby("event_label").duration.sum()
-        return gt_durations, self.data_duration
+        # Compute the duration per class, and total duration for false
+        # positives."""
+        # t_filter = self.ground_truth.event_label == WORLD
+        # if not hasattr(self, "data_duration"):
+            # gt = self.ground_truth[t_filter].copy()
+            # gt["audio_id"] = gt["filename"].apply(lambda x: x.split("_")[0]).values
+            # data_duration = gt.groupby("audio_id")["duration"].apply(lambda x: list(x)[0]).sum()
+            # self.data_duration = data_duration
+        # gt_durations = self.ground_truth.groupby("event_label").duration.sum()
+        # return gt_durations, self.data_duration
 
 
 def compute_psds(prediction_dfs,
@@ -139,7 +140,7 @@ def compute_psds(prediction_dfs,
                  # cttc_threshold=0.0,
                  # alpha_ct=0,
                  # alpha_st=0,
-                 max_efpr=400,
+                 max_efpr=None,
                  save_dir=None):
 
     if not isinstance(ground_truth, pd.DataFrame):
@@ -169,7 +170,8 @@ def compute_psds(prediction_dfs,
     except AssertionError:
         import ipdb; ipdb.set_trace()
 
-    psds_eval = PSDSEval_Grounding(
+    # psds_eval = PSDSEval_Grounding(
+    psds_eval = PSDSEval(
         ground_truth=ground_truth,
         metadata=duration,
         dtc_threshold=dtc_threshold,
@@ -220,10 +222,57 @@ def compute_psds(prediction_dfs,
     return psds_score.value
 
 
+def compute_psds_sed_scores(scores,
+                            ground_truth,
+                            duration,
+                            fname_to_aid,
+                            dtc_threshold=0.5,
+                            gtc_threshold=0.5,
+                            max_efpr=None,
+                            save_dir=None):
+
+    duration = pd.read_csv(duration, sep="\t")
+    aid_to_dur = dict(zip(duration["audio_id"], duration["duration"]))
+    metadata = {}
+    for fname in ground_truth:
+        aid = fname_to_aid[fname]
+        metadata[fname] = aid_to_dur[aid]
+
+    psds, psd_roc, _ = intersection_based.psds(
+        scores=scores,
+        ground_truth=ground_truth,
+        audio_durations=metadata,
+        dtc_threshold=dtc_threshold,
+        gtc_threshold=gtc_threshold,
+        cttc_threshold=None,
+        alpha_ct=0.,
+        alpha_st=0.,
+        unit_of_time='hour',
+        max_efpr=max_efpr,
+        num_jobs=4,
+    )
+
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        import matplotlib.pyplot as plt
+        etpr, efpr = psd_roc
+        plt.figure(figsize=(16, 4))
+        plt.ylabel('eTPR')
+        plt.xlabel('eFPR per hour')
+        plt.step(efpr, etpr, lw=2, where='post')
+        plt.legend(['sed_scores_eval',], loc='lower right')
+        plt.savefig(save_dir / f"PSDS_sedscores_dtc{dtc_threshold}_gtc{gtc_threshold}_maxefpr{max_efpr}.png")
+
+    return psds
+
+
 def compute_th_auc(prediction_dfs,
                    ground_truth,
                    dtc_threshold=0.5,
                    gtc_threshold=0.5,
+                   min_threshold=0.0,
+                   max_threshold=1.0,
                    beta=1.,
                    save_dir=None):
 
@@ -236,11 +285,15 @@ def compute_th_auc(prediction_dfs,
 
     for i, k in enumerate(prediction_dfs.keys()):
         det = prediction_dfs[k]
+        # if abs(k - 0.71) < 1e-6:
+            # import pdb; pdb.set_trace()
         evaluator.add_operating_point(
             det, info={"name": f"Op {i + 1:02d}", "threshold": k}
         )
 
-    th_auc = evaluator.th_auc(beta=beta)
+    th_auc = evaluator.th_auc(beta=beta,
+                              low_th=min_threshold,
+                              high_th=max_threshold)
 
     if save_dir is not None:
         save_dir = Path(save_dir)
@@ -565,8 +618,9 @@ class Grounding_PrecisionRecall(PSDSEval):
             (self.operating_points.threshold >= low_th) & 
             (self.operating_points.threshold <= high_th)]
         sort_idxs = np.argsort(sub_table.threshold.values)
-        return auc(sub_table.threshold.values[sort_idxs],
-                   sub_table.f_score.values[sort_idxs])
+        score = auc(sub_table.threshold.values[sort_idxs],
+                    sub_table.f_score.values[sort_idxs])
+        return score / (high_th - low_th)
 
     def plot_f_threshold(self, fig_path):
         sort_idxs = np.argsort(self.operating_points.threshold.values)

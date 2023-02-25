@@ -4,31 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ScaledDotProduct(nn.Module):
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, audio: torch.Tensor, text: torch.Tensor):
-        a_bs, n_seg, a_dim = audio.size()
-        t_bs, n_txt, t_dim = text.size()
-        assert a_bs == t_bs
-        assert a_dim == t_dim
-        batch_size = a_bs
-        dim = a_dim
-        score = torch.matmul(audio.reshape(-1, dim),
-                             text.reshape(-1, dim).transpose(0, 1))
-        score = torch.sigmoid(score / math.sqrt(dim)).clamp(1e-7, 1.0)
-        score = score.reshape(batch_size, n_seg, batch_size, n_txt)
-        score = score.transpose(1, 2)
-        return score
-
-
 class DotProduct(nn.Module):
 
-    def __init__(self, l2norm=True) -> None:
+    def __init__(self, l2norm=False, scaled=True) -> None:
         super().__init__()
         self.l2norm = l2norm
+        self.scaled = scaled
 
     def forward(self, audio: torch.Tensor, text: torch.Tensor, **kwargs):
         if self.l2norm:
@@ -42,6 +23,8 @@ class DotProduct(nn.Module):
         dim = a_dim
         score = torch.matmul(audio.reshape(-1, dim),
                              text.reshape(-1, dim).transpose(0, 1))
+        if self.scaled:
+            score = score / math.sqrt(dim)
         score = torch.sigmoid(score).clamp(1e-7, 1.0)
         score = score.reshape(batch_size, n_seg, batch_size, n_txt)
         score = score.transpose(1, 2)
@@ -49,9 +32,6 @@ class DotProduct(nn.Module):
 
 
 class ExpNegL2(nn.Module):
-
-    def __init__(self) -> None:
-        super().__init__()
 
     def forward(self, audio: torch.Tensor, text: torch.Tensor):
         a_bs, n_seg, a_dim = audio.size()

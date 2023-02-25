@@ -75,4 +75,23 @@ def linear_softmax_with_lens(features, lens):
     return sum_with_lens(features ** 2, lens) / sum_with_lens(features, lens)
 
 
+def mean_by_group(arr, grp_num):
+    # arr: [total_len, *]
+    # grp_num: [num_group,], sum(grp_num) = total_len
+    index = sum([[i] * num for i, num in enumerate(grp_num)], [])
+    index = torch.as_tensor(index)
+
+    while index.ndim < arr.ndim:
+        index = index.unsqueeze(-1)
+    index = index.expand(-1, *arr.shape[1:]).to(arr.device)
+
+    res = torch.zeros(len(grp_num), *arr.shape[1:]).to(arr.device)
+    res.scatter_add_(0, index, arr)
+    denominator = torch.as_tensor(grp_num).to(res.device)
+        
+    while denominator.ndim < res.ndim:
+        denominator = denominator.unsqueeze(-1)
+
+    res = res / denominator
+    return res
 

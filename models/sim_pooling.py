@@ -3,7 +3,7 @@ import torch.nn as nn
 import models.utils as utils
 
 
-class AllMean(nn.Module):
+class AudioMeanTextMean(nn.Module):
     
     def forward(self, input):
         sim = input["sim"]
@@ -52,6 +52,24 @@ class AudioLinearSoftTextMean(nn.Module):
         sim = utils.linear_softmax_with_lens(sim, audio_len)
         text_len = torch.as_tensor(input["text_len"]).repeat(batch_size)
         sim = utils.mean_with_lens(sim, text_len)
+        sim = sim.reshape(batch_size, batch_size)
+        if torch.isnan(sim).any():
+            import pdb; pdb.set_trace()
+        return sim
+
+
+class AudioLinearSoftTextSum(nn.Module):
+    
+    def forward(self, input):
+        sim = input["sim"]
+        # sim: [bs, bs, a_len, t_len]
+        batch_size, audio_len, text_len = sim.size(0), sim.size(2), sim.size(3)
+        sim = sim.reshape(batch_size * batch_size, audio_len, text_len)
+        audio_len = torch.as_tensor(input["audio_len"]).unsqueeze(1).expand(
+            batch_size, batch_size).reshape(-1)
+        sim = utils.linear_softmax_with_lens(sim, audio_len) # [bs*bs, t_len]
+        text_len = torch.as_tensor(input["text_len"]).repeat(batch_size)
+        sim = utils.sum_with_lens(sim, text_len)
         sim = sim.reshape(batch_size, batch_size)
         if torch.isnan(sim).any():
             import pdb; pdb.set_trace()
