@@ -9,10 +9,15 @@ from models.utils import generate_length_mask
 
 class ExpNegL2(nn.Module):
 
+    def __init__(self, l2norm=True) -> None:
+        super().__init__()
+        self.l2norm = l2norm
+
     def forward(self, audio: torch.Tensor, text: torch.Tensor, **kwargs):
         # audio: [N, T, E], text: [N, E]
-        audio = F.normalize(audio, dim=-1)
-        text = F.normalize(text, dim=-1)
+        if self.l2norm:
+            audio = F.normalize(audio, dim=-1)
+            text = F.normalize(text, dim=-1)
         if text.ndim == 2:
             text = text.unsqueeze(1)
         diff = audio - text # diff: [N, T, E]
@@ -43,9 +48,11 @@ class DotProduct(nn.Module):
         self.activation = activation
         
     def forward(self, audio: torch.Tensor, text: torch.Tensor, **kwargs):
-        audio = F.normalize(audio, dim=-1)
-        text = F.normalize(text, dim=-1)
-        text = text.unsqueeze(1)
+        if self.l2norm:
+            audio = F.normalize(audio, dim=-1)
+            text = F.normalize(text, dim=-1)
+        if text.ndim == 2:
+            text = text.unsqueeze(1)
         score = torch.bmm(audio, text.transpose(1, 2)).squeeze(2)
         if self.activation == "sigmoid":
             score = torch.sigmoid(score)
@@ -119,9 +126,9 @@ class CrossGating(nn.Module):
 
 class AttnGatingExpL2(nn.Module):
 
-    def __init__(self, embed_dim):
+    def __init__(self, embed_dim, l2norm=True):
         super().__init__()
-        self.sim = ExpNegL2()
+        self.sim = ExpNegL2(l2norm=l2norm)
         self.attn = Seq2SeqAttention(embed_dim, embed_dim, embed_dim)
         self.gating = CrossGating(embed_dim)
 
@@ -135,6 +142,27 @@ class AttnGatingExpL2(nn.Module):
         snippet = self.attn(audio, text, audio_len, text_len)
         audio, snippet = self.gating(audio, snippet)
         return self.sim(audio, snippet)
+
+
+class AttnGatingDotProduct(nn.Module):
+
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.attn = Seq2SeqAttention(embed_dim, embed_dim, embed_dim)
+        self.gating = CrossGating(embed_dim)
+
+    def forward(self,
+                audio: torch.Tensor,
+                text: torch.Tensor,
+                audio_len: List,
+                text_len: List):
+        # audio: [batch_size, seq_length, embed_dim]
+        # text: [batch_size, text_len, embed_dim]
+        snippet = self.attn(audio, text, audio_len, text_len)
+        audio, snippet = self.gating(audio, snippet)
+        sim = (audio * snippet).sum(-1)
+        sim = torch.sigmoid(sim).clamp(1e-7, 1.0)
+        return sim
 
 
 class CrossAttention(nn.Module):

@@ -8,18 +8,16 @@ import torch.nn.init as init
 from models.utils import init_weights, mean_with_lens, generate_length_mask
 
 
-class EmbeddingMeanEncoder(nn.Module):
+class EmbeddingLayer(nn.Module):
 
     def __init__(self,
                  vocab_size: int,
                  embed_dim: int,
                  pretrained_embedding: str = None,
-                 freeze_embedding: bool = False,
-                 aggregation: bool = True):
+                 freeze_embedding: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
-        self.aggregation = aggregation
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.core = nn.Embedding(vocab_size, embed_dim)
         self.apply(init_weights)
         if pretrained_embedding is not None:
             self.load_pretrained_embedding(pretrained_embedding,
@@ -27,23 +25,39 @@ class EmbeddingMeanEncoder(nn.Module):
 
     def load_pretrained_embedding(self, weight: str, freeze: bool = True):
         weight = np.load(weight)
-        assert weight.shape == self.embedding.weight.shape, \
-            f"expect embedding with shape {self.embedding.weight.shape} " \
+        assert weight.shape == self.core.weight.shape, \
+            f"expect embedding with shape {self.core.weight.shape} " \
             f"but {weight.shape} is given"
         weight = torch.as_tensor(weight, dtype=torch.float)
         self.embedding = nn.Embedding.from_pretrained(weight, freeze)
 
     def forward(self, input_dict: Dict):
         tokens = input_dict["text"]
-        lens = input_dict["text_len"]
-        lens = torch.as_tensor(lens)
         tokens = tokens.long()
-        embeds = self.embedding(tokens)
-        if self.aggregation:
-            embed = mean_with_lens(embeds, lens)
-            return embed
-        else:
-            return embeds
+        embs = self.core(tokens)
+        return embs
+
+
+class EmbeddingAgg(nn.Module):
+
+    def __init__(self,
+                 vocab_size,
+                 embed_dim,
+                 pretrained_embedding: str = None,
+                 freeze_embedding: bool = False,
+                 aggregation: str = "mean"):
+        super().__init__()
+        self.embedding = EmbeddingLayer(vocab_size, embed_dim,
+            pretrained_embedding, freeze_embedding)
+        self.embed_dim = self.embedding.embed_dim
+        self.agg = aggregation
+
+    def forward(self, input_dict):
+        embs = self.embedding(input_dict)
+        lens = torch.as_tensor(input_dict["text_len"])
+        if self.agg == "mean":
+            out = mean_with_lens(embs, lens)
+            return out
         
 
 class PositionalEncoding(nn.Module):
@@ -109,26 +123,20 @@ class ConvGRUCell(nn.Module):
 class IntraAttention(nn.Module):
 
     def __init__(self,
-                 vocab_size,
-                 embed_dim,
-                 num_layers,
-                 pretrained_embedding=None,
-                 freeze_embedding=False) -> None:
+                 embedding: nn.Module,
+                 num_layers: int,) -> None:
         super().__init__()
-        self.w2v = EmbeddingMeanEncoder(
-            vocab_size,
-            embed_dim,
-            pretrained_embedding,
-            freeze_embedding,
-            aggregation=False)
-        self.embed_dim = embed_dim
-        self.pe = PositionalEncoding(embed_dim, 0.2)
-        self.conv_gru = ConvGRUCell(embed_dim, embed_dim)
+        self.embedding = embedding
+        self.embed_dim = embedding.embed_dim
+        self.pe = PositionalEncoding(self.embed_dim, 0.2)
+        self.conv_gru = ConvGRUCell(self.embed_dim, self.embed_dim)
         self.num_layers = num_layers
 
     def forward(self, input_dict):
         len = input_dict["text_len"]
-        x = self.w2v(input_dict)
+        x = self.embedding(input_dict)
+        if isinstance(x, dict) and "token_emb" in x:
+            x = x["token_emb"]
         batch_size, max_len, emb_dim = x.size()
 
         for _ in range(self.num_layers):
@@ -149,7 +157,7 @@ class IntraAttention(nn.Module):
         return x
 
 
-class SelfAttentionEncoder(nn.Module):
+class SelfAttention(nn.Module):
 
     def __init__(self,
                  vocab_size,
@@ -160,8 +168,8 @@ class SelfAttentionEncoder(nn.Module):
                  freeze_embedding=False) -> None:
         super().__init__()
         self.embed_dim = embed_dim
-        self.w2v = EmbeddingMeanEncoder(vocab_size, embed_dim,
-            pretrained_embedding, freeze_embedding, False)
+        self.w2v = EmbeddingLayer(vocab_size, embed_dim,
+            pretrained_embedding, freeze_embedding)
         self.pe = PositionalEncoding(embed_dim, dropout)
         self.mha = nn.MultiheadAttention(embed_dim, num_heads, dropout,
                                          batch_first=True)
@@ -197,6 +205,9 @@ class Bert(nn.Module):
         self.dummy_param = nn.Parameter(torch.zeros(1))
         self.max_length = max_length
         self.embed_dim = self.model.config.hidden_size
+
+    def load_pretrained(self, pretrained, output_fn):
+        pass
 
     def forward(self, text):
         tokens = self.tokenizer(text, padding="max_length", return_tensors="pt",

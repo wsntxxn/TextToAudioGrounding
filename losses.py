@@ -2,8 +2,6 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import ignite.metrics as metrics
-from ignite.engine.engine import Engine
 
 from models.utils import generate_length_mask
 
@@ -11,24 +9,20 @@ from models.utils import generate_length_mask
 class FrameBceLoss(nn.Module):
 
     def forward(self, output: Dict):
-        prob = output["prob"] # [N, T]
-        if prob.ndim == 3 and prob.size(2) == 1:
-            prob = prob.squeeze(2)
+        frame_sim = output["frame_sim"] # [batch_size, max_len]
+        if frame_sim.ndim == 3 and frame_sim.size(2) == 1:
+            frame_sim = frame_sim.squeeze(2)
         length = output["length"] # [N]
         label = output["label"] # [N, T]
-        # truncated_length = min(prob.size(1), label.size(1))
-        # prob = prob[..., :truncated_length]
-        # label = label[..., :truncated_length]
-        # length = torch.clamp(length, 1, truncated_length)
-        loss = F.binary_cross_entropy(prob, label, reduction="none") # [N, T]
-        mask = generate_length_mask(length).to(prob.device)
+        loss = F.binary_cross_entropy(frame_sim, label, reduction="none") # [N, T]
+        mask = generate_length_mask(length).to(frame_sim.device)
         loss *= mask
         loss = loss.sum() / mask.sum()
         return loss
     
-    def forward_tensor(self, prob, label, length):
-        loss = F.binary_cross_entropy(prob, label, reduction="none") # [N, T]
-        mask = generate_length_mask(length).to(prob.device)
+    def forward_tensor(self, frame_sim, label, length):
+        loss = F.binary_cross_entropy(frame_sim, label, reduction="none") # [N, T]
+        mask = generate_length_mask(length).to(frame_sim.device)
         if loss.ndim == 3:
             mask = mask.unsqueeze(-1).expand(*loss.size())
         loss *= mask
@@ -156,23 +150,18 @@ class MaxMarginRankingLoss(nn.Module):
         return max_margin.mean()
 
 
-class Loss(metrics.Loss):
+class InfoNceLoss(nn.Module):
 
-    def update(self, output: Dict) -> None:
-        # score: [bs, max_len]
-        # label: [bs, max_len]
-        # length: [bs]
-        length = output["length"]
-        average_loss = self._loss_fn(output).detach()
+    def __init__(self):
+        super().__init__()
+        self.loss_fn = nn.CrossEntropyLoss()
 
-        if len(average_loss.shape) != 0:
-            raise ValueError("loss_fn did not return the average loss.")
-
-        n = torch.sum(torch.as_tensor(length))
-        self._sum += average_loss.to(self._device) * n
-        self._num_examples += n
-
-    @torch.no_grad()
-    def iteration_completed(self, engine: Engine) -> None:
-        output = self._output_transform(engine.state.output)
-        self.update(output)
+    def forward(self, output: Dict):
+        sim = output["sim"]
+        logit = sim.T 
+        batch_size = sim.size(0)
+        label = torch.arange(batch_size).to(logit.device)
+        loss_a = self.loss_fn(logit.T, label)
+        loss_t = self.loss_fn(logit, label)
+        loss = (loss_a + loss_t) / 2
+        return loss

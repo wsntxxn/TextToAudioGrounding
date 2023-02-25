@@ -3,7 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.utils import init_weights, linear_softmax_with_lens, max_with_lens
+from models.utils import init_weights, linear_softmax_with_lens, max_with_lens, \
+        mean_by_group
 from utils.train_util import do_mixup
 
 
@@ -54,26 +55,97 @@ class BiEncoder(GroundingModel):
             audio_emb = self.audio_proj(audio_output["embedding"])
         else:
             audio_emb = audio_output["embedding"]
-        text_emb = self.text_encoder(input_dict) # [N, E]
+        text_emb = self.text_encoder(input_dict) # [batch_size, emb_dim]
         if hasattr(self, "text_proj"):
             text_emb = self.text_proj(text_emb)
-        prob = self.match_fn(**{
+        frame_sim = self.match_fn(**{
             "audio": audio_emb,
             "text": text_emb,
             "audio_len": audio_output["length"],
             "text_len": input_dict["text_len"]
-        }) # [N, T]
+        }) # [batch_size, max_len]
         length = audio_output["length"]
         if self.interpolate_ratio != 1 and self.upsample:
-            prob = F.interpolate(
-                prob.unsqueeze(1),
-                prob.size(1) * self.interpolate_ratio,
+            frame_sim = F.interpolate(
+                frame_sim.unsqueeze(1),
+                frame_sim.size(1) * self.interpolate_ratio,
                 mode="linear",
                 align_corners=False
             ).squeeze(1)
             length = length * self.interpolate_ratio
         return {
-            "prob": prob,
+            "frame_sim": frame_sim,
+            "length": length
+        }
+
+
+class MultiTextBiEncoder(BiEncoder):
+
+    def __init__(self,
+                 audio_encoder,
+                 text_encoder,
+                 match_fn,
+                 shared_dim,
+                 text_forward_keys,
+                 pooling="linear_softmax",
+                 add_proj=False,
+                 upsample=False,
+                 freeze_audio_encoder=False,
+                 freeze_text_encoder=False):
+        super().__init__(audio_encoder, text_encoder, match_fn, shared_dim,
+                         add_proj, upsample, freeze_audio_encoder,
+                         freeze_text_encoder)
+        self.text_forward_keys = text_forward_keys
+        self.pooling = pooling
+
+    def forward(self, input_dict):
+        audio_output = self.audio_encoder(input_dict)
+        audio_emb = audio_output["embedding"]
+        if hasattr(self, "audio_proj"):
+            audio_emb = self.audio_proj(audio_emb)
+
+        batch_size = audio_emb.size(0)
+        text_num = input_dict[self.text_forward_keys[0]].shape[1]
+        text_forward_dict = {}
+        for key in self.text_forward_keys:
+            x = input_dict[key]
+            text_forward_dict[key] = x.reshape(x.shape[0] * x.shape[1],
+                                               *x.shape[2:])
+
+        text_emb = self.text_encoder(text_forward_dict)
+        if hasattr(self, "text_proj"):
+            text_emb = self.text_proj(text_emb)
+
+        audio_emb = audio_emb.unsqueeze(1).expand(-1, text_num, -1, -1) # (batch_size, text_num, max_len, emb_dim)
+        audio_emb = audio_emb.reshape(-1, *audio_emb.shape[2:])
+        audio_len = audio_output["length"].unsqueeze(1).expand(-1, text_num)
+        audio_len = audio_len.reshape(-1)
+        text_len = text_forward_dict["text_len"]
+        frame_sim = self.match_fn(**{
+            "audio": audio_emb,
+            "text": text_emb,
+            "audio_len": audio_len,
+            "text_len": text_len
+        }) # [batch_size * text_num, max_len]
+        length = audio_output["length"]
+        frame_sim = frame_sim.reshape(batch_size, text_num, -1).transpose(1, 2)
+        if self.pooling == "linear_softmax":
+            clip_sim = linear_softmax_with_lens(frame_sim, length)
+        elif self.pooling == "max":
+            clip_sim = max_with_lens(frame_sim, length)
+        else:
+            raise Exception(f"Unsupported pooling {self.pooling}")
+        if self.interpolate_ratio != 1 and self.upsample:
+            frame_sim = F.interpolate(
+                frame_sim,
+                frame_sim.size(-1) * self.interpolate_ratio,
+                mode="linear",
+                align_corners=False
+            )
+            length = length * self.interpolate_ratio
+        return {
+            "frame_sim": frame_sim,
+            "clip_sim": clip_sim,
             "length": length
         }
 
@@ -480,6 +552,183 @@ class CrossCnn8_Rnn(nn.Module):
         }
 
 
+class AudioTextAlignByWord(nn.Module):
+
+    def __init__(self,
+                 audio_encoder,
+                 text_encoder,
+                 match_fn,
+                 sim_pooling,
+                 shared_dim,
+                 add_proj=False,
+                 freeze_audio_encoder=False,
+                 freeze_text_encoder=False
+                 ):
+        super().__init__()
+        self.audio_encoder = audio_encoder
+        self.text_encoder = text_encoder
+        self.match_fn = match_fn
+        self.sim_pooling = sim_pooling
+        if audio_encoder.embed_dim != text_encoder.embed_dim or add_proj:
+            self.audio_proj = nn.Linear(audio_encoder.embed_dim, shared_dim)
+            self.text_proj = nn.Linear(text_encoder.embed_dim, shared_dim)
+        if freeze_audio_encoder:
+            for param in self.audio_encoder.parameters():
+                param.requires_grad = False
+        if freeze_text_encoder:
+            for param in self.text_encoder.parameters():
+                param.requires_grad = False
+
+    def forward(self, input_dict):
+        """
+        keys in input_dict:
+            waveform, waveform_len,
+            text, text_len,
+            pool (True/False)
+        """
+        audio_output = self.audio_encoder(input_dict)
+        if hasattr(self, "audio_proj"):
+            audio_emb = self.audio_proj(audio_output["embedding"])
+        else:
+            audio_emb = audio_output["embedding"]
+        # audio_emb: [bs, n_seg, emb_dim]
+        text_emb = self.text_encoder(input_dict)
+        # word_emb: [bs, n_word, emb_dim]
+        if hasattr(self, "text_proj"):
+            text_emb = self.text_proj(text_emb)
+        sim_matrix = self.match_fn(audio_emb, text_emb)
+        # sim: [bs, bs, n_seg, n_word]
+        output_matrix = input_dict.get("output_matrix", False)
+
+        sim = self.sim_pooling({
+            "sim": sim_matrix,
+            "audio_len": audio_output["length"],
+            "text_len": input_dict["text_len"]
+        })
+        
+        output = {
+            "sim": sim,
+        }
+        
+        if output_matrix:
+            output["sim_matrix"] = sim_matrix
+
+        return output
+
+
+class AudioTextAlignByPhrase(nn.Module):
+
+    def __init__(self,
+                 audio_encoder,
+                 text_encoder,
+                 match_fn,
+                 shared_dim,
+                 add_proj=False,
+                 freeze_audio_encoder=False,
+                 freeze_text_encoder=False
+                 ):
+        super().__init__()
+        self.audio_encoder = audio_encoder
+        self.text_encoder = text_encoder
+        self.match_fn = match_fn
+        if audio_encoder.embed_dim != text_encoder.embed_dim or add_proj:
+            self.audio_proj = nn.Linear(audio_encoder.embed_dim, shared_dim)
+            self.text_proj = nn.Linear(text_encoder.embed_dim, shared_dim)
+        if freeze_audio_encoder:
+            for param in self.audio_encoder.parameters():
+                param.requires_grad = False
+        if freeze_text_encoder:
+            for param in self.text_encoder.parameters():
+                param.requires_grad = False
+
+    def forward(self, input_dict):
+        """
+        input_dict:
+            waveform: [bs, n_samples]
+            waveform_len: [bs]
+            phrases: [txt_num, max_txt_len]
+            phrases_num: [bs]
+            phrases_len: [txt_num]
+            text_key: str
+        """
+        audio_output = self.audio_encoder(input_dict)
+        if hasattr(self, "audio_proj"):
+            audio_emb = self.audio_proj(audio_output["embedding"])
+        else:
+            audio_emb = audio_output["embedding"]
+        # audio_emb: [bs, n_seg, emb_dim]
+        phrases_emb = self.text_encoder({
+            "text": input_dict["phrases"],
+            "text_len": input_dict["phrases_len"]
+        })
+        if hasattr(self, "text_proj"):
+            phrases_emb = self.text_proj(phrases_emb)
+        # text_emb: [txt_num, max_txt_len, emb_dim]
+
+        batch_phrase_num = phrases_emb.size(0)
+        phrases_num = input_dict["phrases_num"]
+        phrases_len = input_dict["phrases_len"]
+        batch_size = audio_emb.size(0)
+        sim_matrixes = []
+        sims = torch.empty(batch_size, batch_size)
+
+        output_matrix = input_dict.get("output_matrix", False)
+
+
+        # if input_dict["method"] == "method1":
+            # phrases_emb = torch.split(phrases_emb, phrases_num, dim=0)
+            # phrases_len = torch.split(torch.as_tensor(phrases_len), phrases_num, dim=0)
+            # for i in range(batch_size):
+                # for j in range(batch_size):
+                    
+                    # ph_num_j = phrases_num[j]
+                    # sim_matrix = self.match_fn(**{
+                        # "audio": audio_emb[i: i+1].expand(ph_num_j, -1, -1),
+                        # "text": phrases_emb[j],
+                        # "audio_len": [audio_output["length"][i]] * ph_num_j,
+                        # "text_len": phrases_len[j]
+                    # }) # [ph_num_j, n_seg]
+                    # sim_matrix = sim_matrix.transpose(0, 1)
+                    
+                    # if output_matrix:
+                        # sim_matrixes.append(sim_matrix)
+                    # sim_pooled = linear_softmax_with_lens(
+                        # sim_matrix.mean(1).unsqueeze(0),
+                        # [audio_output["length"][i]]
+                    # )
+                    # sims[i, j] = sim_pooled
+
+        # elif input_dict["method"] == "method2":
+
+
+        for i in range(batch_size):
+            sim_i = self.match_fn(**{
+                "audio": audio_emb[i: i+1].expand(batch_phrase_num, -1, -1),
+                "text": phrases_emb,
+                "audio_len": [audio_output["length"][i]] * batch_phrase_num,
+                "text_len": phrases_len
+            })
+            # sim_i: [txt_num, n_seg]
+            if output_matrix:
+                for j in range(batch_size):
+                    if j == 0:
+                        start = 0
+                    else:
+                        start = end
+                    end = phrases_num[j]
+                    sim_matrixes.append(sim_i[start: end].transpose(0, 1))
+            sim_i = linear_softmax_with_lens(
+                sim_i.transpose(0, 1).unsqueeze(0), [audio_output["length"][i]]
+            )[0]
+            # sim_i: [txt_num]
+            sim_i = mean_by_group(sim_i, phrases_num)
+            # sim_i: [batch_size]
+            sims[i] = sim_i
+
+        return {
+            "sim": sims,
+            "sim_matrix": sim_matrixes
+        }
 
 
 if __name__ == "__main__":
@@ -487,11 +736,11 @@ if __name__ == "__main__":
     import os
     sys.path.append(os.getcwd())
     from models.audio_encoder import CrnnEncoder
-    from models.text_encoder import EmbeddingMeanEncoder
+    from models.text_encoder import EmbeddingAgg
     from models.match import ExpNegL2
     vocab_size = 1500
     # audio_encoder = CrnnEncoder(32000, 256)
-    text_encoder = EmbeddingMeanEncoder(vocab_size, 256)
+    text_encoder = EmbeddingAgg(vocab_size, 256, aggregation="mean")
     # match_fn = ExpNegL2()
     # model = BiEncoder(audio_encoder, text_encoder, match_fn, 256, True)
     model = CrossCnn8_Rnn(32000, text_encoder)

@@ -25,6 +25,14 @@ class Vocabulary(object):
     def __len__(self):
         return len(self.word2idx)
 
+    def state_dict(self):
+        return self.word2idx
+    
+    def load_state_dict(self, state_dict):
+        self.word2idx = state_dict
+        self.idx2word = {idx: word for word, idx in self.word2idx.items()}
+        self.idx = len(self.word2idx)
+
 
 def process(items: List, output: str):
     print("Build Vocab")
@@ -39,7 +47,7 @@ def process(items: List, output: str):
         tokens = item["tokens"].split()
         for token in tokens:
             vocab.add_word(token)
-    pickle.dump(vocab, open(output, "wb"))
+    pickle.dump(vocab.state_dict(), open(output, "wb"))
     print("Total vocabulary size: {}".format(len(vocab)))
     print("Saved vocab to '{}'".format(output))
 

@@ -115,6 +115,10 @@ def get_obj_from_str(string, reload=False):
 def init_obj_from_str(config, **kwargs):
     obj_args = config["args"].copy()
     obj_args.update(kwargs)
+    for k in config:
+        if k not in ["type", "args"] and isinstance(config[k], dict) and \
+            k not in kwargs:
+            obj_args[k] = init_obj_from_str(config[k])
     cls = get_obj_from_str(config["type"])
     obj = cls(**obj_args)
     return obj
@@ -168,6 +172,15 @@ def pack_length(padded, lengths):
     for i in range(len(lengths)):
         packed.append(padded[i][:lengths[i], ...])
     return torch.cat(packed)
+
+
+def pad_sequence(data):
+    if isinstance(data[0], np.ndarray):
+        data = [torch.as_tensor(arr) for arr in data]
+    padded_seq = torch.nn.utils.rnn.pad_sequence(data,
+                                                 batch_first=True)
+    length = [x.shape[0] for x in data]
+    return padded_seq, length
 
 
 def load_pretrained_model(model,
