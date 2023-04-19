@@ -29,25 +29,23 @@ We provide a baseline approach for TAG in this repository. To run the baseline, 
 git clone https://github.com/wsntxxn/TextToAudioGrounding
 pip install -r requirements.txt
 ```
-2. download audio clips and labels from [google drive](https://drive.google.com/file/d/1znGt8OEBdX3uCrnIUXqLz6Pn3NabBxLs/view?usp=sharing).
-```bash
-unzip AudioTextGrounding.zip -d data
-```
-3. extract audio feature:
+2. download audio clips and labels from Zenodo.
+3. pack waveforms, assume the audio files are in $AUDIO:
 ```bash
 cd data
 for split in train val test; do
-  python prepare_wav_csv.py $split/audio $split/wav.csv
-  python prepare_audio_feature.py $split/wav.csv $split/lms.h5 $split/lms.csv lms -n_mels 64 -win_length 640 -hop_length 320
+  python prepare_wav_csv.py $AUDIO/$split $split/wav.csv
+  python pack_waveform.py $split/wav.csv -o $split/waveform.h5 --sample_rate 32000
 done
+python prepare_duration.py test/wav.csv test/duration.csv
 cd ..
 ```
 4. prepare vocabulary file:
 ```bash
 python utils/build_vocab.py data/train/label.json data/train/vocab.pkl
 ```
-5. modify the configuration file `config/conf.yaml` (if needed) and run the training and evaluation:
+5. modify the configuration file `configs/strongly_supervised/biencoder/cdur_w2vmean.yaml` (if needed) and run the training and evaluation:
 ```bash
-python run.py train_evaluate config/conf.yaml data/test/lms.csv data/test/label.json data/test/meta.csv
+python run.py train_evaluate configs/strongly_supervised/biencoder/cdur_w2vmean.yaml configs/strongly_supervised/biencoder/eval.yaml
 ```
 Experiment directory is returned after training and evaluation. Results are also stored in this directory.
