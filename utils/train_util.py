@@ -5,7 +5,11 @@ import importlib
 import random
 import os
 import logging
+from typing import Dict
+
 import yaml
+import toml
+import h5py
 import torch
 import numpy as np
 import pandas as pd
@@ -17,6 +21,13 @@ def load_dict_from_csv(csv, cols):
     df = pd.read_csv(csv, sep="\t")
     output = dict(zip(df[cols[0]], df[cols[1]]))
     return output
+
+
+def read_from_h5(key: str, key_to_h5: Dict, cache: Dict):
+    hdf5_path = key_to_h5[key]
+    if hdf5_path not in cache:
+        cache[hdf5_path] = h5py.File(hdf5_path, "r")
+    return cache[hdf5_path][key][()]
 
 
 def set_seed(seed):
@@ -98,10 +109,10 @@ def pprint_dict(in_dict, print_fn=sys.stdout.write, format='yaml'):
         print_fn(line)
 
 
-def init_obj(module, config, **kwargs):
-    obj_args = config["args"].copy()
-    obj_args.update(kwargs)
-    return getattr(module, config["type"])(**obj_args)
+# def init_obj(module, config, **kwargs):
+    # obj_args = config["args"].copy()
+    # obj_args.update(kwargs)
+    # return getattr(module, config["type"])(**obj_args)
 
 
 def get_obj_from_str(string, reload=False):
@@ -122,6 +133,19 @@ def init_obj_from_str(config, **kwargs):
     cls = get_obj_from_str(config["type"])
     obj = cls(**obj_args)
     return obj
+
+
+def copy_args_recursive(src_cfg, tgt_cfg, keys):
+    for k in src_cfg:
+        if k == "type":
+            continue
+        elif k == "args":
+            for key in src_cfg["args"]:
+                if key in keys:
+                    tgt_cfg["args"][key] = src_cfg["args"][key]
+        else:
+            if k in tgt_cfg:
+                copy_args_recursive(src_cfg[k], tgt_cfg[k], keys)
 
 
 def merge_a_into_b(a, b):
@@ -154,10 +178,19 @@ def load_config(config_file):
 
 
 def parse_config_or_kwargs(config_file, **kwargs):
+    toml_list = []
+    for k, v in kwargs.items():
+        if isinstance(v, str):
+            toml_list.append(f"{k}='{v}'")
+        elif isinstance(v, bool):
+            toml_list.append(f"{k}={str(v).lower()}")
+        else:
+            toml_list.append(f"{k}={v}")
+    toml_str = "\n".join(toml_list)
+    cmd_config = toml.loads(toml_str)
     yaml_config = load_config(config_file)
-    # passed kwargs will override yaml config
-    args = dict(yaml_config, **kwargs)
-    return args
+    merge_a_into_b(cmd_config, yaml_config)
+    return yaml_config
 
 
 def count_parameters(model):
@@ -234,52 +267,6 @@ class MetricImprover:
 
     def load_state_dict(self, state_dict):
         self.__dict__.update(state_dict)
-
-
-def log_results(engine,
-                cv_evaluator, 
-                cv_dataloader, 
-                outputfun=sys.stdout.write,
-                train_metrics=["loss", "accuracy"], 
-                cv_metrics=["loss", "accuracy"]):
-    train_results = engine.state.metrics
-    cv_evaluator.run(cv_dataloader)
-    cv_results = cv_evaluator.state.metrics
-    output_str_list = [
-        "Validation Results - Epoch : {:<4}".format(engine.state.epoch)
-    ]
-    for metric in train_metrics:
-        output = train_results[metric]
-        if isinstance(output, torch.Tensor):
-            output = output.item()
-        output_str_list.append("{} {:<5.2g} ".format(
-            metric, output))
-    for metric in cv_metrics:
-        output = cv_results[metric]
-        if isinstance(output, torch.Tensor):
-            output = output.item()
-        output_str_list.append("{} {:5<.2g} ".format(
-            metric, output))
-
-    outputfun(" ".join(output_str_list))
-
-
-def save_model_on_improved(engine,
-                           criterion_improved,
-                           metric_key,
-                           dump,
-                           save_path):
-    if criterion_improved(engine.state.metrics[metric_key]):
-        torch.save(dump, save_path)
-
-
-def update_lr(engine, scheduler, metric=None):
-    if scheduler.__class__.__name__ == "ReduceLROnPlateau":
-        assert metric is not None, "need validation metric for ReduceLROnPlateau"
-        val_result = engine.state.metrics[metric]
-        scheduler.step(val_result)
-    else:
-        scheduler.step()
 
 
 class AveragedModel(torch_average_model):

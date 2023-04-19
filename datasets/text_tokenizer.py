@@ -37,6 +37,18 @@ class DictTokenizer:
             "text": tokens,
             "text_len": token_lens
         }
+
+    def inverse_transform(self, texts):
+        output = []
+        for text in texts:
+            tokens = []
+            for word_idx in text:
+                if word_idx != 0:
+                    tokens.append(self.vocabulary.idx2word[word_idx])
+                else:
+                    break
+            output.append(" ".join(tokens))
+        return output
             
 
 class HuggingFaceTokenizer:

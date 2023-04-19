@@ -75,6 +75,14 @@ def linear_softmax_with_lens(features, lens):
     return sum_with_lens(features ** 2, lens) / sum_with_lens(features, lens)
 
 
+def exp_softmax_with_lens(features, lens):
+    normed_f = features - features.max(1, keepdim=True)[0]
+    exp_f = torch.exp(normed_f)
+    weight = exp_f / sum_with_lens(exp_f, lens).unsqueeze(1)
+    weighed_f = weight * features
+    return sum_with_lens(weighed_f, lens)
+
+
 def mean_by_group(arr, grp_num):
     # arr: [total_len, *]
     # grp_num: [num_group,], sum(grp_num) = total_len

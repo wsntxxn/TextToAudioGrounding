@@ -1,0 +1,106 @@
+experiment_path: experiments/audiogrounding/strongly_supervised/biencoder/cdur_w2vmean_expnegl2/seed_1
+
+seed: 1
+
+data:
+    train:
+        dataset:
+            type: datasets.single_phrase_dataset.AudioPhraseDataset
+            args:
+                label: data/train/label.json
+                waveform: data/train/waveform.csv
+                time_resolution: 0.08
+        collate_fn:
+            type: datasets.collate_function.TextCollate
+            args:
+                pad_keys: [waveform, label]
+                text_key: phrase
+            tokenizer:
+                type: datasets.text_tokenizer.DictTokenizer
+                args:
+                    vocabulary: data/audiocaps/vocab_state_dict.pkl
+        dataloader_args:
+            batch_size: 32
+            num_workers: 2
+    val:
+        dataset:
+            type: datasets.single_phrase_dataset.AudioPhraseDataset
+            args:
+                label: data/val/label.json
+                waveform: data/val/waveform.csv
+                time_resolution: 0.08
+        collate_fn:
+            type: datasets.collate_function.TextCollate
+            args:
+                pad_keys: [waveform, label]
+                text_key: phrase
+            tokenizer:
+                type: datasets.text_tokenizer.DictTokenizer
+                args:
+                    vocabulary: data/audiocaps/vocab_state_dict.pkl
+        dataloader_args:
+            batch_size: 64
+            num_workers: 2
+        duration: data/val/duration.csv
+
+model:
+    audio_encoder: 
+        type: models.audio_encoder.CrnnEncoder
+        args:
+            embed_dim: 256
+            sample_rate: 32000
+    text_encoder: 
+        type: models.text_encoder.EmbeddingAgg
+        args:
+            embed_dim: 256
+            vocab_size: 5221
+            aggregation: mean
+    match_fn: 
+        type: models.match.ExpNegL2
+        args:
+            text_level: seq
+    type: models.audio_text_model.BiEncoder
+    args:
+        shared_dim: 256
+        add_proj: False
+        upsample: False
+        freeze_text_encoder: False
+        freeze_audio_encoder: False
+
+
+loss: 
+    type: losses.FrameBceLoss
+    args: {}
+
+optimizer: 
+    type: torch.optim.Adam
+    args:
+        lr: 0.001
+
+lr_scheduler:
+    type: torch.optim.lr_scheduler.ReduceLROnPlateau
+    args:
+        mode: min
+        patience: 3
+
+eval_config:
+    n_thresholds: 50
+
+inference_args:
+    window_size: 1
+
+trainer:
+    metric_monitor:
+        mode: min
+        name: loss
+    epochs: 100
+    early_stop: 10
+    lr_update_interval: epoch
+    save_interval: 10
+    include_optim_in_ckpt: False
+    max_grad_norm: 1.0
+    # finetune: True
+
+swa:
+    use: False
+    start: 21

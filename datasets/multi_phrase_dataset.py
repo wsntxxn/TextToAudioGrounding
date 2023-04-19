@@ -9,6 +9,9 @@ import h5py
 from torch.utils.data import Dataset
 from sklearn.metrics.pairwise import cosine_similarity
 
+import sys
+import os
+sys.path.insert(1, os.path.join(os.path.dirname(__file__), ".."))
 from utils.train_util import load_dict_from_csv
 
 
@@ -27,10 +30,16 @@ class AudioSamplePhrasesDataset(Dataset):
                  phrase_num: int,
                  fix_neg: bool,
                  neg_samp_stratg: str = "clustering",
+                 sample_rate: int = 32000,
+                 max_audio_length: float = None,
                  **kwargs):
         self.aid_to_h5 = load_dict_from_csv(waveform, ("audio_id", "hdf5_path"))
         self.cache = {}
-        # self.vocabulary = pickle.load(open(vocabulary, "rb"))
+        if max_audio_length is not None:
+            self.max_audio_len = int(max_audio_length * sample_rate)
+        else:
+            self.max_audio_len = None
+
         self.data = json.load(open(label))
         self.phrase_num = phrase_num
         assert neg_samp_stratg in ("random", "clustering", "similarity")
@@ -61,6 +70,9 @@ class AudioSamplePhrasesDataset(Dataset):
             phrase_embed = kwargs["phrase_embed"]
             self.sim_threshold = kwargs["sim_threshold"]
             self.phrase_to_emb = pickle.load(open(phrase_embed, "rb"))
+            self.phrases = np.array(list(self.phrase_to_emb.keys()))
+            self.phrase_to_idx = {phrase: idx for idx, phrase in 
+                enumerate(self.phrases)}
             self.phrase_embs = []
             for phrase in self.phrases:
                 self.phrase_embs.append(self.phrase_to_emb[phrase])
@@ -98,18 +110,38 @@ class AudioSamplePhrasesDataset(Dataset):
                                            replace=False)
         elif self.neg_samp_stratg == "similarity":
             pos_embs = self.phrase_embs[pos_idxs]
-            cand_phrase_embs = self.phrase_embs[cand_phrase_idxs]
-            sims = cosine_similarity(pos_embs, cand_phrase_embs)
-            sims = sims.max(axis=0)
-            try:
-                neg_idxs = np.random.choice(
-                    np.where(sims < self.sim_threshold)[0],
-                    size=neg_phrase_num,
-                    replace=False)
-            except ValueError as e:
-                print(f"No enough negative phrases for {pos_phrases}, try smaller phrase number")
-                raise Exception(e)
-            neg_phrases = cand_phrases[neg_idxs]
+
+            # cand_phrase_embs = self.phrase_embs[cand_phrase_idxs]
+            # sims = cosine_similarity(pos_embs, cand_phrase_embs)
+            # sims = sims.max(axis=0)
+            # try:
+                # cand_idxs = np.where(sims < self.sim_threshold)[0]
+                # neg_idxs = np.random.choice(
+                    # cand_idxs,
+                    # size=neg_phrase_num,
+                    # replace=False)
+            # except ValueError as e:
+                # print(f"No enough negative phrases for {pos_phrases}, try smaller phrase number")
+                # raise Exception(e)
+
+            neg_idxs = []
+            np.random.shuffle(cand_phrase_idxs)
+            pointer = 0
+            while len(neg_idxs) < neg_phrase_num and pointer < len(cand_phrase_idxs):
+                left = neg_phrase_num - len(neg_idxs)
+                cand_phrase_idxs_part = cand_phrase_idxs[pointer: pointer + neg_phrase_num]
+                cand_phrase_embs = self.phrase_embs[cand_phrase_idxs_part]
+                sims = cosine_similarity(pos_embs, cand_phrase_embs)
+                sims = sims.max(axis=0)
+                cand_idxs = np.where(sims < self.sim_threshold)[0]
+                neg_idxs.extend(cand_phrase_idxs_part[cand_idxs[:left]])
+                pointer += neg_phrase_num
+
+            while len(neg_idxs) < neg_phrase_num:
+                left = neg_phrase_num - len(neg_idxs)
+                neg_idxs.extend(neg_idxs[:left])
+
+            neg_phrases = self.phrases[neg_idxs]
         elif self.neg_samp_stratg == "clustering":
             neg_phrases = []
             pos_cluster_idxs = list(set([self.phrase_to_cluster_idx[phrase]
@@ -134,10 +166,11 @@ class AudioSamplePhrasesDataset(Dataset):
                 while cur_neg_phrase_num > len(cand_cluster_idxs):
                     cluster_samp_num += 1
                     cur_neg_phrase_num -= len(cand_cluster_idxs)
-                cluster_samp_num[np.random.choice(
-                    np.arange(len(cand_cluster_idxs)),
-                    size=cur_neg_phrase_num,
-                    replace=False)] = 1
+                if cur_neg_phrase_num > 0:
+                    cluster_samp_num[np.random.choice(
+                        np.arange(len(cand_cluster_idxs)),
+                        size=cur_neg_phrase_num,
+                        replace=False)] += 1
                 for idx, samp_num in enumerate(cluster_samp_num):
                     neg_cluster_idx = cand_cluster_idxs[idx]
                     samp_phrase = np.random.choice(
@@ -158,8 +191,13 @@ class AudioSamplePhrasesDataset(Dataset):
         audiocap_id = audio_item["audiocap_id"]
         waveform = read_from_h5(audio_id, self.aid_to_h5, self.cache)
         waveform = np.array(waveform, dtype=np.float32)
+        if self.max_audio_len is not None and \
+                waveform.shape[0] > self.max_audio_len:
+            start = random.randint(0, waveform.shape[0] - self.max_audio_len)
+            waveform = waveform[start: start + self.max_audio_len]
+
         pos_phrases = [phrase_item["phrase"] for phrase_item in 
-            audio_item["phrases"]]
+           audio_item["phrases"]][:self.phrase_num]
         
         neg_phrases = self.sample_negative_phrases(pos_phrases, audiocap_id)
         if isinstance(neg_phrases, np.ndarray):
@@ -177,6 +215,45 @@ class AudioSamplePhrasesDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+
+class AudioCaptionPhrasesEvalDataset(Dataset):
+
+    def __init__(self,
+                 waveform: str,
+                 label: str,
+                 max_phrase_words: int = 10) -> None:
+        self.aid_to_h5 = load_dict_from_csv(waveform, ("audio_id", "hdf5_path"))
+        self.cache = {}
+        self.data = json.load(open(label))
+        self.generate_index()
+
+    def generate_index(self):
+        self.idxs = []
+        for audio_idx, audio_item in enumerate(self.data):
+            for phrase_idx, phrase_item in enumerate(audio_item["phrases"]):
+                self.idxs.append((audio_idx, phrase_idx))
+
+    def __getitem__(self, index):
+        audio_idx, phrase_idx = self.idxs[index]
+        audio_item = self.data[audio_idx]
+        audio_id = audio_item["audio_id"]
+        audiocap_id = audio_item["audiocap_id"]
+        waveform = read_from_h5(audio_id, self.aid_to_h5, self.cache)
+        waveform = np.array(waveform, dtype=np.float32)
+
+        phrase_item = audio_item["phrases"][phrase_idx]
+        phrase = phrase_item["phrase"]
+        return {
+            "audiocap_id": audiocap_id,
+            "waveform": waveform,
+            "phrases": [phrase,],
+            "start_index": phrase_item["start_index"],
+            "end_index": phrase_item["end_index"]
+        }
+
+    def __len__(self):
+        return len(self.idxs)
 
 
 class AudioCaptionPhrasesDataset(Dataset):
@@ -218,3 +295,63 @@ class AudioCaptionPhrasesDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+
+class SinglePhraseEvalDataset(Dataset):
+
+    def __init__(self,
+                 waveform: str,
+                 label: str,
+                 sample_rate: int = 32000):
+        self.aid_to_h5 = load_dict_from_csv(waveform, ("audio_id", "hdf5_path"))
+        self.cache = {}
+        self.data = json.load(open(label))
+        self.sample_rate = sample_rate
+        self.generate_index()
+        
+    def generate_index(self):
+        self.idxs = []
+        for audio_idx, audio_item in enumerate(self.data):
+            for phrase_idx, phrase_item in enumerate(audio_item["phrases"]):
+                self.idxs.append((audio_idx, phrase_idx))
+
+    def __getitem__(self, index):
+        audio_idx, phrase_idx = self.idxs[index]
+        audio_item = self.data[audio_idx]
+        audio_id = audio_item["audio_id"]
+        audiocap_id = audio_item["audiocap_id"]
+        waveform = read_from_h5(audio_id, self.aid_to_h5, self.cache)
+        waveform = np.array(waveform, dtype=np.float32)
+        phrase_item = audio_item["phrases"][phrase_idx]
+        phrase = [phrase_item["phrase"],]
+        return {
+            "audiocap_id": audiocap_id,
+            "waveform": waveform,
+            "phrase": phrase,
+            "start_index": phrase_item["start_index"],
+            "end_index": phrase_item["end_index"],
+        }
+
+    def __len__(self):
+        return len(self.idxs)
+
+
+if __name__ == "__main__":
+    import utils.train_util as train_util
+    from tqdm import tqdm
+    config = train_util.parse_config_or_kwargs(
+        "configs/weakly_supervised/audiocaps/phrase_level/" \
+        "free_text_tagging/cnn8rnn_w2vmean_similarity.yaml")
+    
+    cfg = config["data"]["train"].copy()
+    dataset = train_util.init_obj_from_str(cfg["dataset"])
+    collate_fn = train_util.init_obj_from_str(cfg["collate_fn"])
+    kwargs = {
+        "collate_fn": collate_fn,
+        "shuffle": True,
+        "num_workers": 4
+    }
+    dataloader = torch.utils.data.DataLoader(dataset, **kwargs)
+    
+    for batch in tqdm(dataloader):
+        pass

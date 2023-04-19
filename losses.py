@@ -1,4 +1,5 @@
 from typing import Dict
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -110,7 +111,7 @@ class VectorQuantizeLoss(nn.Module):
         }
 
 
-class MaxMarginRankingLoss(nn.Module):
+class MaxMarginRankingLoss(nn.Module): # triplet weighted
 
     def __init__(self, margin=1, fix_norm=True, lamda1=1):
         super().__init__()
@@ -152,16 +153,149 @@ class MaxMarginRankingLoss(nn.Module):
 
 class InfoNceLoss(nn.Module):
 
-    def __init__(self):
+    def __init__(self, tau=0.07):
         super().__init__()
         self.loss_fn = nn.CrossEntropyLoss()
+        self.tau = tau
 
     def forward(self, output: Dict):
         sim = output["sim"]
-        logit = sim.T 
+        logit = sim.T / self.tau
         batch_size = sim.size(0)
         label = torch.arange(batch_size).to(logit.device)
         loss_a = self.loss_fn(logit.T, label)
         loss_t = self.loss_fn(logit, label)
         loss = (loss_a + loss_t) / 2
         return loss
+
+
+# triplet max
+class MaxTripletLoss(nn.Module):
+
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, output):
+        sim = output["sim"]
+        n = sim.size(0)  # batch size
+        label = torch.arange(n)
+
+        sim_ap = torch.diag(sim).view(n, 1)
+        d1 = sim_ap.expand_as(sim)
+        d2 = sim_ap.t().expand_as(sim)
+
+        # compare every diagonal score to scores in its column
+        # caption retrieval
+        cost_s = F.relu(self.margin + sim - d1)
+        # compare every diagonal score to scores in its row
+        # audio retrieval
+        cost_a = F.relu(self.margin + sim - d2)
+
+        # clear diagonals
+        mask = label.expand(n, n).eq(label.expand(n, n).t()).to(cost_a.device)
+        cost_s = cost_s.masked_fill(mask, 0)
+        cost_a = cost_a.masked_fill(mask, 0)
+
+        cost_s = cost_s.max(1)[0]
+        cost_a = cost_a.max(0)[0]
+        loss = (cost_s.sum() + cost_a.sum()) / n
+
+        return loss
+
+
+# triplet random
+class RandomTripletLoss(nn.Module):
+
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, output):
+        sim = output["sim"]
+        n = sim.size(0)  # batch size
+        label = torch.arange(n)
+
+        sim_ap = torch.diag(sim).view(n, 1)
+        d1 = sim_ap.expand_as(sim)
+        d2 = sim_ap.t().expand_as(sim)
+
+        # compare every diagonal score to scores in its column
+        # caption retrieval
+        cost_s = F.relu(self.margin + sim - d1)
+        # compare every diagonal score to scores in its row
+        # audio retrieval
+        cost_a = F.relu(self.margin + sim - d2)
+
+        # clear diagonals
+        mask = label.expand(n, n).eq(label.expand(n, n).t()).to(cost_a.device)
+        cost_s = cost_s.masked_fill(mask, 0)
+        cost_a = cost_a.masked_fill(mask, 0)
+
+        s_index = torch.as_tensor(np.random.randint(n, size=n))
+        cost_s = cost_s[torch.arange(n), s_index]
+        a_index = torch.as_tensor(np.random.randint(n, size=n))
+        cost_a = cost_a[torch.arange(n), a_index]
+        loss = (cost_s.sum() + cost_a.sum()) / n
+
+        return loss
+
+
+# weighted triplet
+class WeightedTripletLoss(nn.Module):
+
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+
+    def polyloss(self, sim_mat, label):
+        epsilon = 1e-5
+        size = sim_mat.size(0)
+        hh = sim_mat.t()
+
+        loss = list()
+        for i in range(size):
+            pos_pair_ = sim_mat[i][i]
+            # pos_pair_ = pos_pair_[pos_pair_ < 1 - epsilon]
+            neg_pair_ = sim_mat[i][label != label[i]]
+
+            neg_pair = neg_pair_[neg_pair_ + self.margin > pos_pair_]
+
+            pos_pair = pos_pair_
+            if len(neg_pair) < 1:
+                continue
+
+            pos_loss = torch.clamp(0.2 * torch.pow(pos_pair, 2) - 0.7 * pos_pair + 0.5, min=0)
+            neg_pair = max(neg_pair)
+            neg_loss = torch.clamp(0.9 * torch.pow(neg_pair, 2) - 0.4 * neg_pair + 0.03, min=0)
+
+            loss.append(pos_loss + neg_loss)
+        for i in range(size):
+            pos_pair_ = hh[i][i]
+            # pos_pair_ = pos_pair_[pos_pair_ < 1 - epsilon]
+            neg_pair_ = hh[i][label != label[i]]
+
+            neg_pair = neg_pair_[neg_pair_ + self.margin > pos_pair_]
+
+            pos_pair = pos_pair_
+            if len(neg_pair) < 1:
+                continue
+            pos_loss = torch.clamp(0.2 * torch.pow(pos_pair, 2) - 0.7 * pos_pair + 0.5, min=0)
+
+            neg_pair = max(neg_pair)
+            neg_loss = torch.clamp(0.9 * torch.pow(neg_pair, 2) - 0.4 * neg_pair + 0.03, min=0)
+            loss.append(pos_loss + neg_loss)
+
+        if len(loss) == 0:
+            # return torch.zeros([], requires_grad=True)
+            return sim_mat.mean() - sim_mat.mean() + 0.0
+
+        loss = sum(loss) / size
+        return loss
+
+    def forward(self, output):
+        scores = output["sim"]
+        label = torch.arange(scores.shape[0])
+        loss = self.polyloss(scores, label)
+        return loss
+
