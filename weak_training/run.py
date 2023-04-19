@@ -56,21 +56,21 @@ class Runner(object):
 
     def get_model(self, print_fn):
 
-        def init_model(config):
-            kwargs = {}
-            for k in config:
-                if k not in ["type", "args", "pretrained"]:
-                    sub_model = init_model(config[k])
-                    if "pretrained" in config[k]:
-                        train_util.load_pretrained_model(
-                            sub_model,
-                            config[k]["pretrained"],
-                            print_fn)
-                    kwargs[k] = sub_model
-            model = train_util.init_obj_from_str(config, **kwargs)
-            return model
-        
-        model = init_model(self.config["model"])
+        cfg = self.config["model"]
+
+        kwargs = {}
+
+        for k in cfg:
+            if k not in ["type", "args", "pretrained"]:
+                sub_model = train_util.init_obj_from_str(cfg[k])
+                if "pretrained" in cfg[k]:
+                    train_util.load_pretrained_model(
+                        sub_model,
+                        cfg[k]["pretrained"],
+                        print_fn)
+                kwargs[k] = sub_model
+
+        model = train_util.init_obj_from_str(cfg, **kwargs)
 
         return model
 
@@ -83,6 +83,10 @@ class Runner(object):
                     batch[k] = v.long().to(self.device)
                 else:
                     batch[k] = v.float().to(self.device)
+
+        if not training:
+            batch["text"] = batch["text"].unsqueeze(1)
+            batch["text_len"] = np.array(batch["text_len"])[:, np.newaxis]
 
         input_dict = {
             "specaug": False
@@ -435,6 +439,9 @@ class Runner(object):
             yaml.dump(self.config, writer, default_flow_style=False, indent=4)
 
         self.logger = train_util.init_logger(exp_dir / "train.log")
+        if "SLURM_JOB_ID" in os.environ:
+            self.logger.info(f"Slurm job id: {os.environ['SLURM_JOB_ID']}")
+            self.logger.info(f"Slurm node: {os.environ['SLURM_JOB_NODELIST']}")
         train_util.pprint_dict(self.config, self.logger.info)
 
         self.train_loader = self.get_train_dataloader()
@@ -523,6 +530,211 @@ class Runner(object):
 
         return exp_dir
 
+    
+    def eval_inference(self, dataloader):
+        import sed_scores_eval
+        
+        gt_list = []
+        gt_dict = {}
+        fname_to_aid = {}
+        for audio_item in dataloader.dataset.data:
+            audiocap_id = audio_item["audiocap_id"]
+            audio_id = audio_item["audio_id"]
+            for phrase_item in audio_item["phrases"]:
+                start_index = phrase_item["start_index"]
+                fname = f"{audiocap_id}_{start_index}"
+                gt_dict[fname] = []
+                fname_to_aid[fname] = audio_id
+                for onset, offset in phrase_item["segments"]:
+                    if onset == 0 and offset == 0:
+                        continue
+                    gt_list.append({
+                        "filename": fname,
+                        "event_label": "fake_event",
+                        "onset": onset,
+                        "offset": offset,
+                        "audio_id": audio_id,
+                    })
+                    gt_dict[fname].append((
+                        onset,
+                        offset,
+                        "fake_event"
+                    ))
+        gt_df = pd.DataFrame(gt_list)
+
+        event_classes = ["fake_event"]
+        n_thresholds = self.config["eval_config"]["n_thresholds"]
+        thresholds = np.arange(
+            1 / (n_thresholds * 2), 1, 1 / n_thresholds)
+        window_size = self.config["inference_args"]["window_size"]
+        time_resolution = self.config["inference_args"]["time_resolution"]
+        n_connect = math.ceil(0.5 / time_resolution)
+
+        pred_buffer = {th: [] for th in thresholds}
+        score_buffer = {}
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch in tqdm(dataloader, unit="batch",
+                              ascii=True, ncols=100, leave=False):
+                output = self.forward(batch, training=False)
+                for idx in range(len(batch["audiocap_id"])):
+                    audiocap_id = batch["audiocap_id"][idx]
+                    start_index = batch["start_index"][idx]
+                    fname = f"{audiocap_id}_{start_index}"
+                    if fname not in gt_df["filename"].unique():
+                        continue
+
+                    prob = output["frame_sim"][idx, :, 0]
+                    prob = torch.clamp(prob, min=0.0, max=1.0)
+
+                    scores_arr = prob.unsqueeze(-1).cpu().numpy()
+                    timestamps = np.arange(prob.shape[0] + 1) * \
+                        time_resolution
+                    score_buffer[fname] = sed_scores_eval.utils.create_score_dataframe(
+                        scores_arr, timestamps=timestamps,
+                        event_classes=event_classes)
+                    for th in thresholds:
+                        filtered_prob = eval_util.median_filter(
+                            prob.unsqueeze(0).cpu(),
+                            window_size=window_size,
+                            threshold=th
+                        )[0]
+                        change_indices = eval_util.find_contiguous_regions(
+                            eval_util.connect_clusters(
+                                filtered_prob,
+                                n_connect
+                            )
+                        )
+                        for row in change_indices:
+                            pred_buffer[th].append({
+                                "filename": fname,
+                                "event_label": "fake_event",
+                                "onset": row[0],
+                                "offset": row[1]
+                            })
+
+        for th in thresholds:
+            if len(pred_buffer[th]) > 0:
+                pred_df = pd.DataFrame(pred_buffer[th])
+            else:
+                pred_df = pd.DataFrame({
+                    "filename": [],
+                    "event_label": [],
+                    "onset": [],
+                    "offset": []
+                })
+            pred_df = eval_util.predictions_to_time(
+                pred_df, ratio=time_resolution)
+            pred_buffer[th] = pred_df
+
+        output = {
+            "pred_buffer": pred_buffer,
+            "gt_df": gt_df,
+            "score_buffer": score_buffer,
+            "gt_dict": gt_dict,
+            "fname_to_aid": fname_to_aid
+        }
+        
+        return output
+
+
+    def evaluate(self, experiment_path, eval_config):
+        eval_config = train_util.parse_config_or_kwargs(eval_config)
+
+        exp_dir = Path(experiment_path)
+        self.config = train_util.parse_config_or_kwargs(exp_dir / "config.yaml" )
+        self.config["resume"] = exp_dir / eval_config["resume"]
+        self.model = self.get_model(print)
+        self.resume_checkpoint(finetune=True)
+        
+
+        key_copy_from_train = ["vocabulary"]
+        train_util.copy_args_recursive(self.config["data"]["train"],
+                                       eval_config["data"]["test"],
+                                       key_copy_from_train)
+
+        dataset = train_util.init_obj_from_str(
+            eval_config["data"]["test"]["dataset"])
+        collate_fn = train_util.init_obj_from_str(
+            eval_config["data"]["test"]["collate_fn"])
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            shuffle=False,
+            collate_fn=collate_fn,
+            batch_size=1)
+
+        self.model = self.model.to(self.device)
+
+        if "eval_config" not in self.config:
+            self.config["eval_config"] = {}
+        if "inference_args" not in self.config:
+            self.config["inference_args"] = {}
+        self.config["eval_config"]["n_thresholds"] = eval_config["n_thresholds"]
+        self.config["inference_args"]["window_size"] = eval_config["window_size"]
+        self.config["inference_args"]["time_resolution"] = eval_config[
+            "time_resolution"]
+
+        output = self.eval_inference(dataloader)
+
+        pred_buffer = output["pred_buffer"]
+
+        pred_dir = exp_dir / "predictions"
+        pred_dir.mkdir(exist_ok=True)
+        for th in pred_buffer:
+            pred_buffer[th].to_csv(
+                pred_dir / f"predictions_th_{th:.2f}.tsv",
+                sep="\t",
+                index=False,
+            )
+
+        psds_dir = eval_config.get("psds_dir", "psds")
+
+        f_output = exp_dir / eval_config["output"]
+        if not f_output.parent.exists():
+            f_output.parent.mkdir(parents=True)
+        writer = open(f_output.__str__(), "w")
+
+        for max_efpr in eval_config["max_efprs"]:
+            # psds = eval_util.compute_psds(
+                # pred_buffer,
+                # output["gt_df"],
+                # eval_config["data"]["test"]["duration"],
+                # dtc_threshold=0.5,
+                # gtc_threshold=0.5,
+                # save_dir=exp_dir / psds_dir,
+                # max_efpr=max_efpr
+            # )
+            psds = eval_util.compute_psds_sed_scores(
+                scores=output["score_buffer"],
+                ground_truth=output["gt_dict"],
+                duration=eval_config["data"]["test"]["duration"],
+                fname_to_aid=output["fname_to_aid"],
+                dtc_threshold=0.5,
+                gtc_threshold=0.5,
+                save_dir=exp_dir / psds_dir,
+                max_efpr=max_efpr
+            )
+            print(f"max_efpr: {max_efpr}, psds: {psds:.1%}")
+            print(f"max_efpr: {max_efpr}, psds: {psds:.1%}", file=writer)
+
+        th_auc_dir = eval_config.get("th_auc_dir", "th_auc")
+        for min_th, max_th in zip([0.0, 0.2, 0.0], [1.0, 0.8, 0.8]):
+            th_auc = eval_util.compute_th_auc(
+                pred_buffer,
+                output["gt_df"].drop(["event_label", "audio_id"], axis=1),
+                dtc_threshold=0.5,
+                gtc_threshold=0.5,
+                min_threshold=min_th,
+                max_threshold=max_th,
+                save_dir=exp_dir / th_auc_dir
+            )
+            print(f"threshold: {min_th:.2f} ~ {max_th:.2f}, th_auc: {th_auc:.1%}")
+            print(f"threshold: {min_th:.2f} ~ {max_th:.2f}, th_auc: {th_auc:.1%}",
+                  file=writer)
+
+        writer.close()
+
 
     def train_evaluate(self,
                        train_config,
@@ -533,16 +745,20 @@ class Runner(object):
         return experiment_path
 
 
-    def debug(self, config):
-        self.config = train_util.parse_config_or_kwargs(config)
-        train_loader = self.get_train_dataloader()
+    def debug(self, config, **kwargs):
+        self.config = train_util.parse_config_or_kwargs(config, **kwargs)
+        # train_loader = self.get_train_dataloader()
+        train_loader = self.get_val_dataloader()
         self.model = self.get_model(print).to(self.device)
         loss_fn = train_util.init_obj_from_str(self.config["loss"])
+        
+        train_iter = iter(train_loader)
+        for _ in trange(len(train_loader)):
+            batch = next(train_iter)
+            output = self.forward(batch, training=True)
+            loss = loss_fn(output)
+            loss.backward()
 
-        batch = next(iter(train_loader))
-        output = self.forward(batch, training=True)
-        loss = loss_fn(output)
-        loss.backward()
 
 if __name__ == "__main__":
     fire.Fire(Runner)

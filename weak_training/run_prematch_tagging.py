@@ -690,8 +690,7 @@ class Runner(Base):
         self.model = self.get_model(print)
         self.resume_checkpoint(finetune=True)
         
-        # key_copy_from_train = ["phrase_embed", "as_label_embed", "cluster_model"]
-        key_copy_from_train = ["as_label_embed", "cluster_model"]
+        key_copy_from_train = ["phrase_embed", "as_label_embed", "cluster_model"]
         for key in key_copy_from_train:
             if key in self.config["data"]["train"]["dataset"]["args"]:
                 eval_config["data"]["test"]["dataset"]["args"][

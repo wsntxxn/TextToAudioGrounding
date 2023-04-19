@@ -310,6 +310,109 @@ class Runner(object):
         return output
 
 
+    def eval_random_inference(self, dataloader):
+        import sed_scores_eval
+
+        gt_list = []
+        gt_dict = {}
+        fname_to_aid = {}
+        for audio_item in dataloader.dataset.data:
+            audiocap_id = audio_item["audiocap_id"]
+            audio_id = audio_item["audio_id"]
+            for phrase_item in audio_item["phrases"]:
+                start_index = phrase_item["start_index"]
+                fname = f"{audiocap_id}_{start_index}"
+                gt_dict[fname] = []
+                fname_to_aid[fname] = audio_id
+                for onset, offset in phrase_item["segments"]:
+                    if onset == 0 and offset == 0:
+                        continue
+                    gt_list.append({
+                        "filename": fname,
+                        "event_label": "fake_event",
+                        "onset": onset,
+                        "offset": offset,
+                        "audio_id": audio_id,
+                    })
+                    gt_dict[fname].append((
+                        onset,
+                        offset,
+                        "fake_event"
+                    ))
+        gt_df = pd.DataFrame(gt_list)
+
+        event_classes = ["fake_event"]
+        n_thresholds = self.config["eval_config"]["n_thresholds"]
+        thresholds = np.arange(
+            1 / (n_thresholds * 2), 1, 1 / n_thresholds)
+        time_resolution = self.config["time_resolution"]
+        window_size = self.config["eval_config"]["window_size"]
+        n_connect = math.ceil(0.5 / time_resolution)
+        sample_rate = dataloader.dataset.sample_rate
+
+        pred_buffer = {th: [] for th in thresholds}
+        score_buffer = {}
+
+        with torch.no_grad():
+            for batch in tqdm(dataloader, unit="batch",
+                              ascii=True, ncols=100, leave=False):
+                for idx in range(len(batch["audiocap_id"])):
+                    audiocap_id = batch["audiocap_id"][idx]
+                    start_index = batch["start_index"][idx]
+                    fname = f"{audiocap_id}_{start_index}"
+                    if fname not in gt_df["filename"].unique():
+                        continue
+                    audio_len = batch["waveform"][idx].shape[0] / sample_rate
+                    seq_len = int(audio_len / time_resolution)
+                    scores_arr = np.random.uniform(0.0, 1.0, (seq_len,))
+                    timestamps = np.arange(seq_len + 1) * time_resolution
+                    score_buffer[fname] = sed_scores_eval.utils.create_score_dataframe(
+                            scores_arr[:, np.newaxis], timestamps=timestamps,
+                        event_classes=event_classes)
+                    for th in thresholds:
+                        filtered_prob = eval_util.median_filter(
+                            scores_arr[np.newaxis, :],
+                            window_size=window_size,
+                            threshold=th
+                        )[0]
+                        change_indices = eval_util.find_contiguous_regions(
+                            eval_util.connect_clusters(
+                                filtered_prob,
+                                n_connect
+                            )
+                        )
+                        for row in change_indices:
+                            pred_buffer[th].append({
+                                "filename": fname,
+                                "event_label": "fake_event",
+                                "onset": row[0],
+                                "offset": row[1]
+                            })
+
+        for th in thresholds:
+            if len(pred_buffer[th]) > 0:
+                pred_df = pd.DataFrame(pred_buffer[th])
+            else:
+                pred_df = pd.DataFrame({
+                    "filename": [],
+                    "event_label": [],
+                    "onset": [],
+                    "offset": []
+                })
+            pred_df = eval_util.predictions_to_time(
+                pred_df, ratio=time_resolution)
+            pred_buffer[th] = pred_df
+
+        output = {
+            "pred_buffer": pred_buffer,
+            "gt_df": gt_df,
+            "score_buffer": score_buffer,
+            "gt_dict": gt_dict,
+            "fname_to_aid": fname_to_aid
+        }
+        
+        return output
+
     def eval_psds(self, dataloader, data_duration, return_score=True):
 
         ground_truth = []
@@ -843,6 +946,64 @@ class Runner(object):
         writer.close()
 
 
+    def evaluate_random(self, eval_config):
+        eval_config = train_util.parse_config_or_kwargs(eval_config)
+
+        dataset = train_util.init_obj_from_str(
+            eval_config["data"]["test"]["dataset"])
+        collate_fn = train_util.init_obj_from_str(
+            eval_config["data"]["test"]["collate_fn"])
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            shuffle=False,
+            collate_fn=collate_fn,
+            batch_size=1)
+
+        self.config = {
+            "eval_config": {
+                "n_thresholds": eval_config["n_thresholds"],
+                "window_size": eval_config["window_size"]
+            },
+            "time_resolution": eval_config["time_resolution"]
+        }
+
+        output = self.eval_random_inference(dataloader)
+
+        pred_buffer = output["pred_buffer"]
+
+        f_output = Path(eval_config["output"])
+        if not f_output.parent.exists():
+            f_output.parent.mkdir(parents=True)
+        writer = open(f_output.__str__(), "w")
+
+        for max_efpr in eval_config["max_efprs"]:
+            psds = eval_util.compute_psds_sed_scores(
+                scores=output["score_buffer"],
+                ground_truth=output["gt_dict"],
+                duration=eval_config["data"]["test"]["duration"],
+                fname_to_aid=output["fname_to_aid"],
+                dtc_threshold=0.5,
+                gtc_threshold=0.5,
+                max_efpr=max_efpr
+            )
+            print(f"max_efpr: {max_efpr}, psds: {psds:.1%}")
+            print(f"max_efpr: {max_efpr}, psds: {psds:.1%}", file=writer)
+
+        for min_th, max_th in zip([0.0, 0.2], [1.0, 0.8]):
+            th_auc = eval_util.compute_th_auc(
+                pred_buffer,
+                output["gt_df"].drop(["event_label", "audio_id"], axis=1),
+                dtc_threshold=0.5,
+                gtc_threshold=0.5,
+                min_threshold=min_th,
+                max_threshold=max_th,
+            )
+            print(f"threshold: {min_th:.2f} ~ {max_th:.2f}, th_auc: {th_auc:.1%}")
+            print(f"threshold: {min_th:.2f} ~ {max_th:.2f}, th_auc: {th_auc:.1%}",
+                  file=writer)
+
+        writer.close()
+
     def evaluate_psds(self,
                       experiment_path,
                       eval_config):
@@ -1215,6 +1376,7 @@ class Runner(object):
         output = self.forward(batch, training=True)
         loss = loss_fn(output)
         loss.backward()
+
 
 if __name__ == "__main__":
     fire.Fire(Runner)

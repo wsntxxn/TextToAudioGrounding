@@ -4,7 +4,6 @@ import torch
 from utils.train_util import pad_sequence
 
 
-
 class VarLenPadCollate:
 
     def __init__(self, pad_keys=[], sort_key=None):
@@ -60,6 +59,8 @@ class TextCollate:
                     output[key] = []
                 output[key].append(data_dict[key])
 
+        output["text_key"] = self.text_key
+
         for key in data_batch[0].keys():
             try:
                 if key in self.pad_keys:
@@ -99,6 +100,8 @@ class VarNumTextCollate:
                 if key not in output:
                     output[key] = []
                 output[key].append(data_dict[key])
+
+        output["text_key"] = self.text_key
 
         for key in data_batch[0].keys():
             try:

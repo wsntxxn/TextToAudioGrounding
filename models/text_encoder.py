@@ -29,13 +29,29 @@ class EmbeddingLayer(nn.Module):
             f"expect embedding with shape {self.core.weight.shape} " \
             f"but {weight.shape} is given"
         weight = torch.as_tensor(weight, dtype=torch.float)
-        self.embedding = nn.Embedding.from_pretrained(weight, freeze)
+        self.core = nn.Embedding.from_pretrained(weight, freeze)
 
     def forward(self, input_dict: Dict):
         tokens = input_dict["text"]
         tokens = tokens.long()
         embs = self.core(tokens)
         return embs
+
+
+class AttentionPooling(nn.Module):
+
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.fc = nn.Linear(emb_dim, 1)
+
+    def forward(self, x, lens):
+        # x: [bs, seq_len, emb_dim]
+        score = self.fc(x).squeeze(-1)
+        mask = generate_length_mask(lens).to(x.device)
+        score = score.masked_fill(mask == 0, -1e10)
+        weight = torch.softmax(score, dim=1)
+        out = (x * weight.unsqueeze(-1)).sum(1)
+        return out
 
 
 class EmbeddingAgg(nn.Module):
@@ -51,17 +67,66 @@ class EmbeddingAgg(nn.Module):
             pretrained_embedding, freeze_embedding)
         self.embed_dim = self.embedding.embed_dim
         self.agg = aggregation
+        if aggregation == "attention":
+            self.attn = AttentionPooling(embed_dim)
 
     def forward(self, input_dict):
         embs = self.embedding(input_dict)
         lens = torch.as_tensor(input_dict["text_len"])
         if self.agg == "mean":
             out = mean_with_lens(embs, lens)
-            return out
+        elif self.agg == "attention":
+            out = self.attn(embs, lens)
+        else:
+            raise Exception(f"{self.agg} not supported")
+        return {
+            "token_emb": embs,
+            "seq_emb": out
+        }
+
+
+class RnnEncoder(nn.Module):
+    
+    def __init__(self,
+                 vocab_size,
+                 embed_dim,
+                 hidden_dim,
+                 num_layers,
+                 dropout,
+                 bidirectional,
+                 rnn_type,
+                 pooling="mean"):
+        super().__init__()
+        self.embedding = EmbeddingLayer(vocab_size, embed_dim)
+        assert rnn_type in ("RNN", "GRU", "LSTM")
+        self.rnn = getattr(nn.modules.rnn, rnn_type)(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout,
+            bidirectional=bidirectional
+        )
+        self.embed_dim = hidden_dim * (bidirectional + 1)
+        self.pooling = pooling
+
+    
+    def forward(self, input_dict):
+        x = self.embedding(input_dict)
+        token_emb, h = self.rnn(x) # token_emb: (bs, token_num, hid_dim(*2) )
         
+        text_len = torch.as_tensor(input_dict["text_len"])
+        if self.pooling == "mean":
+            seq_emb = mean_with_lens(token_emb, text_len)
+
+        return {
+            "token_emb": token_emb,
+            "seq_emb": seq_emb
+        }
+
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout, max_len=30):
+    def __init__(self, d_model, dropout, max_len=100):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model)
@@ -124,13 +189,15 @@ class IntraAttention(nn.Module):
 
     def __init__(self,
                  embedding: nn.Module,
-                 num_layers: int,) -> None:
+                 num_layers: int,
+                 pooling: str = "mean") -> None:
         super().__init__()
         self.embedding = embedding
         self.embed_dim = embedding.embed_dim
         self.pe = PositionalEncoding(self.embed_dim, 0.2)
         self.conv_gru = ConvGRUCell(self.embed_dim, self.embed_dim)
         self.num_layers = num_layers
+        self.pooling = pooling
 
     def forward(self, input_dict):
         len = input_dict["text_len"]
@@ -154,7 +221,13 @@ class IntraAttention(nn.Module):
 
             x = self.conv_gru(message, x)
 
-        return x
+        if self.pooling == "mean":
+            seq_emb = mean_with_lens(x, len)
+
+        return {
+            "token_emb": x,
+            "seq_emb": seq_emb
+        }
 
 
 class SelfAttention(nn.Module):
@@ -168,7 +241,7 @@ class SelfAttention(nn.Module):
                  freeze_embedding=False) -> None:
         super().__init__()
         self.embed_dim = embed_dim
-        self.w2v = EmbeddingLayer(vocab_size, embed_dim,
+        self.embedding = EmbeddingLayer(vocab_size, embed_dim,
             pretrained_embedding, freeze_embedding)
         self.pe = PositionalEncoding(embed_dim, dropout)
         self.mha = nn.MultiheadAttention(embed_dim, num_heads, dropout,
@@ -176,13 +249,16 @@ class SelfAttention(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
     def forward(self, input_dict):
-        x = self.w2v(input_dict)
+        x = self.embedding(input_dict)
         x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = self.pe(x)
         lens = torch.as_tensor(input_dict["text_len"]) + 1
         padding_mask = ~generate_length_mask(lens).to(x.device)
         x, attn = self.mha(x, x, x, padding_mask)
-        return x[:, 0]
+        return {
+            "token_emb": x[:, 1:],
+            "seq_emb": x[:, 0]
+        }
 
 
 class Bert(nn.Module):
@@ -218,7 +294,7 @@ class Bert(nn.Module):
         # [CLS] pooling
         text_emb = output.last_hidden_state[:, 0, :]
         return {
-            "sentence_emb": text_emb,
+            "seq_emb": text_emb,
             "token_emb": output.last_hidden_state,
             "attention_mask": tokens["attention_mask"]
         }
@@ -238,6 +314,9 @@ class SentenceBert(nn.Module):
         for k in tokens:
             tokens[k] = tokens[k].to(self.dummy_param.device)
         output = self.model(tokens)
-        return output["sentence_embedding"]
+        return {
+            "seq_emb": output["sentence_embedding"],
+            "token_emb": output
+        }
 
 

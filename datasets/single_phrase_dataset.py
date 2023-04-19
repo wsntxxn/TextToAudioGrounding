@@ -22,11 +22,11 @@ class AudioPhraseEvalDataset(Dataset):
     def __init__(self,
                  waveform,
                  label,
-                 vocabulary):
+                 sample_rate: int = 32000):
         self.aid_to_h5 = load_dict_from_csv(waveform, ("audio_id", "hdf5_path"))
         self.cache = {}
-        self.vocabulary = pickle.load(open(vocabulary, "rb"))
         self.data = json.load(open(label))
+        self.sample_rate = sample_rate
         self.generate_index()
         
     def generate_index(self):
@@ -65,12 +65,10 @@ class AudioPhraseDataset(AudioPhraseEvalDataset):
     def __init__(self,
                  waveform: str,
                  label: str,
-                 vocabulary: str,
                  time_resolution: float = 0.02,
                  sample_rate: int = 32000):
-        super().__init__(waveform, label, vocabulary)
+        super().__init__(waveform, label, sample_rate)
         self.time_resolution = time_resolution
-        self.sample_rate = sample_rate
 
     def __getitem__(self, index):
         output = super().__getitem__(index)

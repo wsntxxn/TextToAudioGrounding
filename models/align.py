@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 class DotProduct(nn.Module):
 
-    def __init__(self, l2norm=False, scaled=True) -> None:
+    def __init__(self, l2norm=False, scaled=False) -> None:
         super().__init__()
         self.l2norm = l2norm
         self.scaled = scaled
