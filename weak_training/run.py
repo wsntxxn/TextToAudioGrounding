@@ -747,13 +747,12 @@ class Runner(object):
 
     def debug(self, config, **kwargs):
         self.config = train_util.parse_config_or_kwargs(config, **kwargs)
-        # train_loader = self.get_train_dataloader()
-        train_loader = self.get_val_dataloader()
+        train_loader = self.get_train_dataloader()
         self.model = self.get_model(print).to(self.device)
         loss_fn = train_util.init_obj_from_str(self.config["loss"])
         
         train_iter = iter(train_loader)
-        for _ in trange(len(train_loader)):
+        for _ in trange(10):
             batch = next(train_iter)
             output = self.forward(batch, training=True)
             loss = loss_fn(output)
