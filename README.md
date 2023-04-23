@@ -19,7 +19,7 @@ The current label format: a list of `audio_item`, each containing
   - phrase: tokens of the current query phrase
   - start_index: index of the first token of `phrase`, starting from 0 (the index of the first token in `tokens` is 0)
   - end_index: index of the last token of `phrase`
-  - segments: a list of [`onset`, `offset`]  timestamp annotations
+  - segments: a list of `[onset, offset]`  timestamp annotations
 
 ## TAG baseline
 

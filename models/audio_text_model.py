@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.utils import init_weights, linear_softmax_with_lens, max_with_lens, \
-        mean_by_group
+        mean_with_lens, exp_softmax_with_lens, mean_by_group
 from utils.train_util import do_mixup
 
 
@@ -170,6 +170,10 @@ class MultiTextBiEncoder(BiEncoder):
             clip_sim = linear_softmax_with_lens(frame_sim, length)
         elif self.pooling == "max":
             clip_sim = max_with_lens(frame_sim, length)
+        elif self.pooling == "mean":
+            clip_sim = mean_with_lens(frame_sim, length)
+        elif self.pooling == "exp_softmax":
+            clip_sim = exp_softmax_with_lens(frame_sim, length)
         else:
             raise Exception(f"Unsupported pooling {self.pooling}")
         if self.interpolate_ratio != 1 and self.upsample:

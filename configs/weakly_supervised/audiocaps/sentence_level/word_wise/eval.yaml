@@ -4,8 +4,8 @@ data:
             type: datasets.single_phrase_dataset.AudioPhraseEvalDataset
             args:
                 waveform: data/all/waveform.csv
-                label: data/test/label_non_trivial_50percent.json
                 # label: data/test/label.json
+                label: data/test/label_non_trivial_50percent.json
         collate_fn:
             type: datasets.collate_function.TextCollate
             args:
@@ -24,5 +24,5 @@ window_size: 1
 n_thresholds: 50
 resume: best.pth
 max_efprs: [400, 600, 800, 1000, Null]
-# output: result_sum.txt
+# output: result_mean.txt
 output: non_trivial_50percent_samples/result_mean.txt
