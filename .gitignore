@@ -106,9 +106,9 @@ venv.bak/
 # mypy
 .mypy_cache/
 
-# Results
-experiments/*
-experiments_dataresplit/*
+# Experiment configurations and checkpoints
+configs/
+experiments*/*
 
 # Vscode/vim files
 .vscode/
@@ -118,13 +118,8 @@ experiments_dataresplit/*
 logs/
 
 # Data files
-data/random_resplit/audio
-data/all
-data/audiocaps
-data/train
-data/val
-data/test
-data/old_label
-dataset_creation/annotation
-dataset_creation/random_resplit
-dataset_creation/update_data
+data/*
+!data/*.py
+dataset_creation
+
+useless_backup

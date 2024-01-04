@@ -1,3 +1,4 @@
+import math
 from typing import Dict
 import numpy as np
 import torch
@@ -38,6 +39,106 @@ class ClipBceLoss(nn.Module):
 
     def forward_tensor(self, prob, label):
         return F.binary_cross_entropy(prob, label)
+
+
+class MilNceLoss(nn.Module):
+
+    def __init__(self, tau=1.0) -> None:
+        super().__init__()
+        self.tau = tau
+
+    def forward(self, output: Dict):
+        clip_sim = output["clip_sim"]
+        label = output["label"]
+        nominator = torch.logsumexp(clip_sim * label / self.tau, dim=1)
+        denominator = torch.logsumexp(clip_sim / self.tau, dim=1)
+        return torch.mean(denominator - nominator)
+
+
+class FocalClipBceLoss(nn.Module):
+
+    def __init__(self, gamma=2, alpha=0.25) -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, output: Dict):
+        clip_sim = output["clip_sim"]
+        label = output["label"]
+
+        loss = -self.alpha * torch.pow(1 - clip_sim, self.gamma) * label * \
+            torch.log(clip_sim) - (1 - self.alpha) * torch.pow(clip_sim, self.gamma) * \
+            (1.0 - label) * torch.log(1 - clip_sim)
+        return loss.mean()
+
+
+class ClipBceLossFreqWeight(nn.Module):
+
+    def __init__(self, C, gamma) -> None:
+        super().__init__()
+        self.C = C
+        self.gamma = gamma
+
+    def forward(self, output: Dict):
+        counts = output["counts"]
+        label = output["label"]
+        weight = (self.C / (self.C + counts)) ** self.gamma
+        weight = torch.as_tensor(weight).to(output["clip_sim"].device)
+        weight = torch.where(label == 0.0, 1.0, weight)
+        return F.binary_cross_entropy(output["clip_sim"], label, weight=weight)
+
+
+class SymmetricClipBceLoss(nn.Module):
+
+    def __init__(self, a=1, b=1, eps=1e-3) -> None:
+        super().__init__()
+        self.a = a
+        self.b = b
+        self.eps = eps
+
+    def forward(self, output: Dict):
+        clip_sim = output["clip_sim"]
+        label = output["label"]
+        loss = F.binary_cross_entropy(clip_sim, label)
+        loss += F.binary_cross_entropy(label.clamp(self.eps, 1.0 - self.eps), clip_sim)
+        return loss
+
+
+class OriginSymmetricClipBceLoss(nn.Module):
+
+    def __init__(self, a=1, b=1, eps=1e-3) -> None:
+        super().__init__()
+        self.a = a
+        self.b = b
+        self.A = math.log(eps)
+
+    def forward(self, output: Dict):
+        clip_sim = output["clip_sim"]
+        label = output["label"]
+        loss = F.binary_cross_entropy(clip_sim, label)
+        reverse_loss = - (label * (1 - clip_sim) * self.A + (1 - label) * self.A * clip_sim).mean()
+        tot_loss = self.a * loss + self.b * reverse_loss
+        return tot_loss
+
+
+class PriorAdjustedClipBceLoss(nn.Module):
+
+    def __init__(self, data_size, tau=1) -> None:
+        super().__init__()
+        self.data_size = data_size # [n_classes, ]
+        self.tau = tau
+
+    def forward(self, output: Dict):
+        clip_sim = output["clip_sim"]
+        label = output["label"]
+        counts = output["counts"]
+        counts = torch.as_tensor(counts).to(clip_sim.device)
+        prior = counts / self.data_size
+        adjusted_one_logit = clip_sim * ((prior) ** self.tau)
+        adjusted_zero_logit = (1 - clip_sim) * ((1 - prior) ** self.tau)
+        adjusted_clip_sim = adjusted_one_logit / (adjusted_one_logit + adjusted_zero_logit)
+        loss = F.binary_cross_entropy(adjusted_clip_sim, label)
+        return loss
 
 
 class MaskedClipBceLoss(nn.Module):
@@ -81,17 +182,28 @@ class ClipMaskedFrameBceLoss(nn.Module):
 
 class ClipFrameBceLoss(nn.Module):
 
-    def __init__(self, frame_weight):
+    def __init__(self,
+                 frame_weight,
+                 clip_label_key="weak_label",
+                 clip_prob_key="clip_sim",
+                 frame_label_key="strong_label",
+                 frame_prob_key="frame_sim"):
         super().__init__()
         self.clip_loss_fn = ClipBceLoss()
         self.frame_loss_fn = FrameBceLoss()
         self.frame_weight = frame_weight
+        self.clip_label_key = clip_label_key
+        self.clip_prob_key = clip_prob_key
+        self.frame_label_key = frame_label_key
+        self.frame_prob_key = frame_prob_key
     
     def forward(self, output: Dict):
         return (1 - self.frame_weight) * self.clip_loss_fn.forward_tensor(
-            output["clip_sim"], output["weak_label"]) + \
+            output[self.clip_prob_key], output[self.clip_label_key]) + \
             self.frame_weight * self.frame_loss_fn.forward_tensor(
-                output["frame_sim"], output["strong_label"], output["length"])
+                output[self.frame_prob_key],
+                output[self.frame_label_key],
+                output["length"])
 
 
 class VectorQuantizeLoss(nn.Module):

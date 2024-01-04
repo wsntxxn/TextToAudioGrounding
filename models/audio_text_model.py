@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import repeat
 
 from models.utils import init_weights, linear_softmax_with_lens, max_with_lens, \
         mean_with_lens, exp_softmax_with_lens, mean_by_group
@@ -125,15 +126,14 @@ class MultiTextBiEncoder(BiEncoder):
 
         audio_emb = audio_emb.unsqueeze(1).expand(-1, text_num, -1, -1) # (batch_size, text_num, max_len, emb_dim)
         audio_emb = audio_emb.reshape(-1, *audio_emb.shape[2:])
-        audio_len = audio_output["length"].unsqueeze(1).expand(-1, text_num)
-        audio_len = audio_len.reshape(-1)
+        audio_len = repeat(audio_output["length"], "b -> (b n)", n=text_num)
         text_len = text_forward_dict["text_len"]
 
         forward_dict = {
-            "audio_emb": audio_emb,
-            "text_emb": text_emb,
-            "audio_len": audio_output["length"],
-            "text_len": text_len
+            "audio_emb": audio_emb, # (b*n, T, e)
+            "text_emb": text_emb, # (b*n, N, e)
+            "audio_len": audio_len, # (b*n,)
+            "text_len": text_len # (b*n,)
         }
         if self.cross_encoder is not None:
             cross_encoded = self.cross_encoder(forward_dict)
@@ -178,11 +178,11 @@ class MultiTextBiEncoder(BiEncoder):
             raise Exception(f"Unsupported pooling {self.pooling}")
         if self.interpolate_ratio != 1 and self.upsample:
             frame_sim = F.interpolate(
-                frame_sim,
+                frame_sim.transpose(1, 2),
                 frame_sim.size(-1) * self.interpolate_ratio,
                 mode="linear",
                 align_corners=False
-            )
+            ).transpose(1, 2)
             length = length * self.interpolate_ratio
         return {
             "frame_sim": frame_sim,
@@ -229,11 +229,16 @@ class AudioTagging(nn.Module):
         logit = self.fc_output(output["embedding"])
         prob = torch.sigmoid(logit)
         if self.pooling == "linear_softmax":
-            clip_prob = linear_softmax_with_lens(prob, output["length"])
+            pooling_fn = linear_softmax_with_lens
         elif self.pooling == "max":
-            clip_prob = max_with_lens(prob, output["length"])
+            pooling_fn = max_with_lens
+        elif self.pooling == "mean":
+            pooling_fn = mean_with_lens
+        elif self.pooling == "exp_softmax":
+            pooling_fn = exp_softmax_with_lens
         else:
             raise Exception(f"Unsupported pooling {self.pooling}")
+        clip_prob = pooling_fn(prob, output["length"])
         return {
             "frame_sim": prob,
             "clip_sim": clip_prob,

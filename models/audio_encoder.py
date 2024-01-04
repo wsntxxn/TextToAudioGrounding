@@ -91,6 +91,7 @@ class Cnn8_Rnn(nn.Module):
         super(Cnn8_Rnn, self).__init__()
 
         self.downsample_ratio = 4     # Downsampled ratio
+        self.time_resolution = 0.04
         self.freeze_cnn = freeze_cnn
         self.freeze_bn = freeze_bn
 

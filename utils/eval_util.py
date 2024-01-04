@@ -12,6 +12,7 @@ from sklearn.metrics import auc
 from psds_eval import PSDSEval, plot_psd_roc
 from psds_eval.psds import WORLD, PSDSEvalError
 from sed_scores_eval import intersection_based
+from sed_scores_eval.utils.auc import staircase_auc
 
 
 def find_contiguous_regions(activity_array):
@@ -222,6 +223,30 @@ def compute_psds(prediction_dfs,
     return psds_score.value
 
 
+def sed_scores_eval_psds_with_max_efpr_none(
+        scores, ground_truth, audio_durations, *,
+        dtc_threshold, gtc_threshold, cttc_threshold=None,
+        alpha_ct=.0, alpha_st=.0, unit_of_time='hour', max_efpr=100.,
+        time_decimals=6, num_jobs=1
+    ):
+    effective_tp_rate, effective_fp_rate, single_class_psds_rocs = intersection_based.psd_roc(
+        scores=scores, ground_truth=ground_truth, audio_durations=audio_durations,
+        dtc_threshold=dtc_threshold, gtc_threshold=gtc_threshold,
+        cttc_threshold=cttc_threshold, alpha_ct=alpha_ct, alpha_st=alpha_st,
+        unit_of_time=unit_of_time, max_efpr=max_efpr,
+        time_decimals=time_decimals, num_jobs=num_jobs,
+    )
+    psd_roc_auc = staircase_auc(
+        effective_tp_rate, effective_fp_rate, max_x=max_efpr)
+    if max_efpr is None:
+        max_efpr = max(effective_fp_rate)
+    return (
+        psd_roc_auc/max_efpr,
+        (effective_tp_rate, effective_fp_rate),
+        single_class_psds_rocs
+    )
+
+
 def compute_psds_sed_scores(scores,
                             ground_truth,
                             duration,
@@ -238,7 +263,7 @@ def compute_psds_sed_scores(scores,
         aid = fname_to_aid[fname]
         metadata[fname] = aid_to_dur[aid]
 
-    psds, psd_roc, _ = intersection_based.psds(
+    psds, psd_roc, _ = sed_scores_eval_psds_with_max_efpr_none(
         scores=scores,
         ground_truth=ground_truth,
         audio_durations=metadata,
@@ -433,7 +458,9 @@ class Grounding_PrecisionRecall(PSDSEval):
         if gt_t is None:
             raise PSDSEvalError("The ground truth cannot be set without data")
 
-        self._validate_input_table(
+        # self._validate_input_table(
+            # gt_t, self.detection_cols, "ground truth", allow_empty=True)
+        self._validate_simple_dataframe(
             gt_t, self.detection_cols, "ground truth", allow_empty=True)
 
         ground_truth_t = gt_t.sort_values(by=self.detection_cols[:2],
@@ -446,7 +473,9 @@ class Grounding_PrecisionRecall(PSDSEval):
         self.ground_truth = ground_truth_t
 
     def _init_det_table(self, det_t):
-        self._validate_input_table(
+        # self._validate_input_table(
+            # det_t, self.detection_cols, "detection", allow_empty=True)
+        self._validate_simple_dataframe(
             det_t, self.detection_cols, "detection", allow_empty=True)
         detection_t = det_t.sort_values(by=self.detection_cols[:2], axis=0)
         detection_t["duration"] = detection_t.offset - detection_t.onset
@@ -632,4 +661,3 @@ class Grounding_PrecisionRecall(PSDSEval):
         plt.xlabel("threshold")
         plt.ylabel("f_score")
         plt.savefig(fig_path, dpi=150, bbox_inches="tight")
-        

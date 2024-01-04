@@ -30,6 +30,7 @@ class AudioSamplePhrasesDataset(Dataset):
                  phrase_num: int,
                  fix_neg: bool,
                  neg_samp_stratg: str = "clustering",
+                 max_phrase_length: int = None,
                  sample_rate: int = 32000,
                  max_audio_length: float = None,
                  **kwargs):
@@ -40,13 +41,25 @@ class AudioSamplePhrasesDataset(Dataset):
         else:
             self.max_audio_len = None
 
+        self.max_phrase_len = max_phrase_length
+
         self.data = json.load(open(label))
         self.phrase_num = phrase_num
         assert neg_samp_stratg in ("random", "clustering", "similarity")
         self.phrases = []
+        fil_data = []
         for audio_item in self.data:
+            excluded = True
             for phrase_item in audio_item["phrases"]:
+                phrase = phrase_item["phrase"]
+                if self.max_phrase_len is not None:
+                    if len(phrase.split()) > self.max_phrase_len:
+                        continue
                 self.phrases.append(phrase_item["phrase"])
+                excluded = False
+            if not excluded:
+                fil_data.append(audio_item)
+        self.data = fil_data
         self.phrases = np.array(list(set(self.phrases)))
         self.phrase_to_idx = {phrase: idx for idx, phrase in 
             enumerate(self.phrases)}
@@ -70,9 +83,20 @@ class AudioSamplePhrasesDataset(Dataset):
             phrase_embed = kwargs["phrase_embed"]
             self.sim_threshold = kwargs["sim_threshold"]
             self.phrase_to_emb = pickle.load(open(phrase_embed, "rb"))
-            self.phrases = np.array(list(self.phrase_to_emb.keys()))
-            self.phrase_to_idx = {phrase: idx for idx, phrase in 
-                enumerate(self.phrases)}
+            if "negative_pool" in kwargs:
+                self.phrases = []
+                with open(kwargs["negative_pool"], "r") as reader:
+                    for line in reader.readlines():
+                        phrase = line.strip()
+                        if self.max_phrase_len is not None:
+                            if len(phrase.split()) > self.max_phrase_len:
+                                continue
+                        self.phrases.append(phrase)
+                self.phrases = np.array(self.phrases)
+
+            self.phrase_to_emb = {phrase: emb for phrase, emb in
+                self.phrase_to_emb.items() if phrase in self.phrases}
+
             self.phrase_embs = []
             for phrase in self.phrases:
                 self.phrase_embs.append(self.phrase_to_emb[phrase])
@@ -89,6 +113,9 @@ class AudioSamplePhrasesDataset(Dataset):
             for phrase in phrases:
                 phrase_to_cluster_idx[phrase] = cluster_idx
                 if phrase in self.phrases:
+                    if self.max_phrase_len is not None:
+                        if len(phrase.split()) > self.max_phrase_len:
+                            continue
                     filtered_phrases.append(phrase)
             cluster_idx_to_phrases[cluster_idx] = filtered_phrases
         return cluster_idx_to_phrases, phrase_to_cluster_idx
@@ -110,19 +137,6 @@ class AudioSamplePhrasesDataset(Dataset):
                                            replace=False)
         elif self.neg_samp_stratg == "similarity":
             pos_embs = self.phrase_embs[pos_idxs]
-
-            # cand_phrase_embs = self.phrase_embs[cand_phrase_idxs]
-            # sims = cosine_similarity(pos_embs, cand_phrase_embs)
-            # sims = sims.max(axis=0)
-            # try:
-                # cand_idxs = np.where(sims < self.sim_threshold)[0]
-                # neg_idxs = np.random.choice(
-                    # cand_idxs,
-                    # size=neg_phrase_num,
-                    # replace=False)
-            # except ValueError as e:
-                # print(f"No enough negative phrases for {pos_phrases}, try smaller phrase number")
-                # raise Exception(e)
 
             neg_idxs = []
             np.random.shuffle(cand_phrase_idxs)
@@ -157,8 +171,9 @@ class AudioSamplePhrasesDataset(Dataset):
                     size=neg_phrase_num,
                     replace=False)
                 for neg_cluster_idx in neg_cluster_idxs:
-                    neg_phrases.append(np.random.choice(
-                        self.cluster_idx_to_phrases[neg_cluster_idx]))
+                    if len(self.cluster_idx_to_phrases[neg_cluster_idx]) > 0:
+                        neg_phrases.append(np.random.choice(
+                            self.cluster_idx_to_phrases[neg_cluster_idx]))
             else:
                 # fewer cluster centers than requested phrase number, some clusters have to be sampled multiple times
                 cluster_samp_num = np.zeros_like(cand_cluster_idxs)
@@ -179,6 +194,9 @@ class AudioSamplePhrasesDataset(Dataset):
                         replace=False)
                     neg_phrases.extend(samp_phrase.tolist())
 
+        while len(neg_phrases) < neg_phrase_num:
+            neg_phrases.append(neg_phrases[-1])
+
         if self.fix_neg:
             self.acid_to_neg[audiocap_id] = [self.phrase_to_idx[phrase] for phrase in neg_phrases]
         
@@ -196,8 +214,13 @@ class AudioSamplePhrasesDataset(Dataset):
             start = random.randint(0, waveform.shape[0] - self.max_audio_len)
             waveform = waveform[start: start + self.max_audio_len]
 
-        pos_phrases = [phrase_item["phrase"] for phrase_item in 
-           audio_item["phrases"]][:self.phrase_num]
+        pos_phrases = []
+        for phrase_item in audio_item["phrases"][:self.phrase_num]:
+            phrase = phrase_item["phrase"]
+            if self.max_phrase_len is not None:
+                if len(phrase.split()) > self.max_phrase_len:
+                    continue
+            pos_phrases.append(phrase)
         
         neg_phrases = self.sample_negative_phrases(pos_phrases, audiocap_id)
         if isinstance(neg_phrases, np.ndarray):
@@ -215,6 +238,36 @@ class AudioSamplePhrasesDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+
+class SamplePhrasesCountDataset(AudioSamplePhrasesDataset):
+
+    def __init__(self,
+                 waveform: str,
+                 label: str,
+                 phrase_num: int,
+                 fix_neg: bool,
+                 neg_samp_stratg: str = "clustering",
+                 max_phrase_length: int = None,
+                 sample_rate: int = 32000,
+                 max_audio_length: float = None,
+                 **kwargs):
+        super().__init__(waveform, label, phrase_num, fix_neg, neg_samp_stratg,
+                         max_phrase_length, sample_rate, max_audio_length,
+                         **kwargs)
+        assert "phrase_count" in kwargs
+        self.phrase_to_count = json.load(open(kwargs["phrase_count"]))
+
+    def __getitem__(self, index):
+        output = super().__getitem__(index)
+        phrases = output["phrases"]
+        counts = []
+        if self.neg_samp_stratg == "similarity":
+            for phrase in phrases:
+                count = self.phrase_to_count[phrase]
+                counts.append(count)
+        output["counts"] = counts
+        return output
 
 
 class AudioCaptionPhrasesEvalDataset(Dataset):

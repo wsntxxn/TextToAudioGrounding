@@ -23,29 +23,51 @@ The current label format: a list of `audio_item`, each containing
 
 ## TAG baseline
 
-We provide a baseline approach for TAG in this repository. To run the baseline, complete the following steps:
+We provide a baseline approach for TAG in this repository. To run the baseline: 
 1. checkout the code and install the required python packages:
 ```bash
 git clone https://github.com/wsntxxn/TextToAudioGrounding
 pip install -r requirements.txt
 ```
 2. download audio clips and labels from Zenodo.
-3. pack waveforms, assume the audio files are in $AUDIO:
+3. pack waveforms, assume the audio files are in `$AUDIO`:
 ```bash
-cd data
+mkdir data/audiogrounding && cd data/audiogrounding
 for split in train val test; do
   python prepare_wav_csv.py $AUDIO/$split $split/wav.csv
   python pack_waveform.py $split/wav.csv -o $split/waveform.h5 --sample_rate 32000
 done
 python prepare_duration.py test/wav.csv test/duration.csv
-cd ..
+cd ../..
 ```
 4. prepare vocabulary file:
 ```bash
-python utils/build_vocab.py data/train/label.json data/train/vocab.pkl
+python utils/build_vocab.py data/audiogrounding/train/label.json data/audiogrounding/train/vocab.pkl
 ```
-5. modify the configuration file `configs/strongly_supervised/biencoder/cdur_w2vmean.yaml` (if needed) and run the training and evaluation:
+5. run the training and evaluation:
 ```bash
-python run.py train_evaluate configs/strongly_supervised/biencoder/cdur_w2vmean.yaml configs/strongly_supervised/biencoder/eval.yaml
+python python_scripts/training/run_strong.py train_evaluate $TRAIN_CFG $EVAL_CFG
 ```
-Experiment directory is returned after training and evaluation. Results are also stored in this directory.
+`$TRAIN_CFG` and `$EVAL_CFG` are yaml-formatted configuration files. Example configuration files are provided in `eg_configs/strongly_supervised/audiogrounding/biencoder`.
+
+## Weakly-Supervised Text-to-Audio Grounding (WSTAG)
+
+### Inference
+
+We provide the best-performing WSTAG model, downloaded [here](https://drive.google.com/file/d/1xDQT_KQ6l9Hzcn4QkO1G3XBJmdw1LCVe/view?usp=drive_link). Unzip it into `$MODEL_DIR`:
+```bash
+unzip audiocaps_cnn8rnn_w2vmean_dp_ls_clustering_selfsup.zip -d $MODEL_DIR
+```
+Remember to modify the training data vocabulary path in `$MODEL_DIR/config.yaml` to `$MODEL_DIR/vocab.pkl`. This is the simple word-index mapping we used to train the model.
+Inference:
+```bash
+python python_scripts/inference/inference.py inference_multi_text_model \
+    --experiment_path $MODEL_DIR \
+    --audio $AUDIO \
+    --phrase $PHRASE \
+    --output ./prob.png
+```
+
+### Training
+
+Coming soon!
