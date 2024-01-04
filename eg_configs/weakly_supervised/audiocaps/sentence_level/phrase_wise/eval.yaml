@@ -1,0 +1,27 @@
+data:
+    test:
+        dataset:
+            type: datasets.multi_phrase_dataset.SinglePhraseEvalDataset
+            args:
+                waveform: data/all/waveform.csv
+                label: data/test/label_non_trivial_50percent.json
+                # label: data/test/label.json
+        collate_fn:
+            type: datasets.collate_function.VarNumTextCollate
+            args:
+                text_key: phrase
+                pad_keys: [waveform]
+            tokenizer:
+                type: datasets.text_tokenizer.DictTokenizer
+                args:
+                    vocabulary: data/audiocaps/vocab_state_dict.pkl
+        duration: data/test/duration.csv
+
+
+time_resolution: 0.04
+window_size: 1
+n_thresholds: 50
+resume: best.pth
+max_efprs: [400, 600, 800, 1000, Null]
+# output: result.txt
+output: non_trivial_50percent_samples/result.txt

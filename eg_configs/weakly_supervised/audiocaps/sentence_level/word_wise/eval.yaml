@@ -1,0 +1,28 @@
+data:
+    test:
+        dataset:
+            type: datasets.single_phrase_dataset.AudioPhraseEvalDataset
+            args:
+                waveform: data/audiogrounding/test/waveform.csv
+                # label: data/audiogrounding/test/label.json
+                label: data/audiogrounding/test/label_non_trivial_50percent.json
+        collate_fn:
+            type: datasets.collate_function.TextCollate
+            args:
+                text_key: phrase
+                pad_keys: [waveform]
+            tokenizer:
+                type: datasets.text_tokenizer.DictTokenizer
+                args:
+                    vocabulary: data/audiocaps/vocab.pkl
+        duration: data/audiogrounding/test/duration.csv
+
+
+word_aggregation: mean
+time_resolution: 0.04
+window_size: 1
+n_thresholds: 50
+resume: best.pth
+max_efprs: [400, 600, 800, 1000, Null]
+# output: result_mean.txt
+output: non_trivial_50percent_samples/result_mean.txt

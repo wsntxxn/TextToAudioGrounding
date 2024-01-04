@@ -1,0 +1,94 @@
+experiment_path: experiments/audiocaps/sentence_level/word_wise/cnn8rnn_w2v_dp_amean_tmean/max_margin/seed_1
+
+seed: 1
+
+data:
+    train:
+        dataset:
+            type: datasets.caption_dataset.AudioCaptionDataset
+            args:
+                label: data/audiocaps/train.json
+                waveform: data/audiocaps/waveform.csv
+        collate_fn:
+            type: datasets.collate_function.TextCollate
+            args:
+                text_key: caption
+                pad_keys: [waveform]
+            tokenizer:
+                type: datasets.text_tokenizer.DictTokenizer
+                args:
+                    vocabulary: data/audiocaps/vocab.pkl
+        dataloader_args:
+            batch_size: 32
+            num_workers: 4
+    val:
+        dataset:
+            type: datasets.caption_dataset.AudioCaptionDataset
+            args:
+                label: data/audiocaps/val.json
+                waveform: data/audiocaps/waveform.csv
+        collate_fn:
+            type: datasets.collate_function.TextCollate
+            args:
+                text_key: caption
+                pad_keys: [waveform]
+            tokenizer:
+                type: datasets.text_tokenizer.DictTokenizer
+                args:
+                    vocabulary: data/audiocaps/vocab.pkl
+        dataloader_args:
+            batch_size: 32
+            num_workers: 4
+
+model:
+    audio_encoder:
+        type: models.audio_encoder.Cnn8_Rnn
+        args:
+            sample_rate: 32000
+        pretrained: experiments/pretrained_audio_encoder/audioset_strong_cnn8rnn.pth
+    text_encoder: 
+        type: models.text_encoder.EmbeddingAgg
+        args:
+            embed_dim: 512
+            vocab_size: 5221
+    match_fn: 
+        type: models.align.DotProduct
+        args:
+            l2norm: False
+            scaled: False
+    sim_pooling:
+        type: models.sim_pooling.AudioMeanTextMean
+        args: {}
+    type: models.audio_text_model.AudioTextAlignByWord
+    args:
+        shared_dim: 512
+        add_proj: False
+
+
+loss:
+    type: losses.MaxMarginRankingLoss
+    args: {}
+
+optimizer: 
+    type: torch.optim.Adam
+    args:
+        lr: 0.001
+
+lr_scheduler:
+    type: torch.optim.lr_scheduler.ReduceLROnPlateau
+    args:
+        mode: min
+        factor: 0.1
+        patience: 3
+        threshold: 0.001
+
+trainer:
+    metric_monitor:
+        mode: min
+        name: loss
+    epochs: 100
+    early_stop: 10
+    lr_update_interval: epoch
+    save_interval: 10
+    include_optim_in_ckpt: False
+    max_grad_norm: 1.0
