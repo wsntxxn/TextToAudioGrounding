@@ -1,17 +1,7 @@
-from itertools import chain
-from collections import UserDict
 import numpy as np
 import torch
 import torch.nn as nn
 from audio_text_retrieval_models.base import BaseModel
-from audio_text_retrieval_models.model_pooling import GatedEmbeddingUnit
-# from torch._utils import (
-    # _get_all_device_indices,
-    # _get_available_device_type,
-    # _get_device_index,
-    # _get_devices_properties
-# )
-# from torch.nn.parallel.data_parallel import _check_balance
 
 
 class GradientReversalFunction(torch.autograd.Function):
@@ -37,70 +27,6 @@ class GradientClip(nn.Module):
 
     def forward(self, x):
         return GradientReversalFunction.apply(x, self.alpha)
-
-
-class AudioTextModel(BaseModel):
-    def __init__(self,
-                 audio_encoder,
-                 text_encoder,
-                 audio_dim,
-                 text_dim,
-                 shared_dim,
-                 l2renorm):
-        super().__init__()
-
-        self.audio_encoder = audio_encoder
-        self.text_encoder = text_encoder
-        self.l2renorm = l2renorm
-        self.audio_gating = GatedEmbeddingUnit(audio_dim, shared_dim, True)
-        self.text_gating = GatedEmbeddingUnit(text_dim, shared_dim, True)
- 
-    def forward(self, waveform, wave_length, text):
-
-        if isinstance(text, dict):
-            v = next(iter(text.values()))
-            batch_size = v.shape[0]
-            num_captions = v.shape[1]
-        else:
-            batch_size = text.shape[0]
-            num_captions = text.shape[1]
-
-        audio_emb = self.audio_encoder(waveform, wave_length)["clip_emb"]
-        if self.l2renorm:
-            norm = audio_emb.norm(p=2, dim=-1, keepdim=True)
-            audio_emb = audio_emb.div(norm + 1e-7).clip(-1e3, 1e3)
-        audio_emb = self.audio_gating(audio_emb)
- 
-        if isinstance(text, dict):
-            for k in text:
-                text[k] = text[k].view(batch_size * num_captions, *text[k].size()[2:]) # tokenized id input (b, t)
-        else:
-            text = text.reshape(batch_size * num_captions, -1, text.size(-1)) # embedding input (b, t, e)
-        text_emb = self.text_encoder(text)["clip_emb"]
-        text_emb = self.text_gating(text_emb)
-        text_emb = text_emb.view(batch_size, num_captions, -1)
-                
-        output = {
-            "audio_emb": audio_emb,
-            "text_emb": text_emb
-        }
-
-        return output
-
-    def encode_audio(self, waveform, wave_length):
-
-        audio_emb = self.audio_encoder(waveform, wave_length)["clip_emb"]
-        if self.l2renorm:
-            norm = audio_emb.norm(p=2, dim=-1, keepdim=True)
-            audio_emb = audio_emb.div(norm + 1e-7).clip(-1e3, 1e3)
-        audio_emb = self.audio_gating(audio_emb)
-
-        return audio_emb
-
-    def encode_text(self, text):
-        text_emb = self.text_encoder(text)["clip_emb"]
-        text_emb = self.text_gating(text_emb)
-        return text_emb
 
 
 class AudioTextClip(BaseModel):

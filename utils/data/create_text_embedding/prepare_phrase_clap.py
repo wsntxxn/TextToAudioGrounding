@@ -1,17 +1,17 @@
 import sys
+import os
 import json
 import pickle
 from pathlib import Path
 import fire
 import torch
 from tqdm import trange
-from zsvision.zs_utils import load_json_config
 from transformers import AutoTokenizer
 
-sys.path.insert(1, "/mnt/lustre/sjtu/home/xnx98/work/AudioRetrieval")
-import models.audio_encoder as audio_encoder_arch
-import models.text_encoder as text_encoder_arch
-import models.audio_text_model as module_arch
+sys.path.insert(1, os.getcwd())
+import audio_text_retrieval_models.audio_encoder as audio_encoder_arch
+import audio_text_retrieval_models.text_encoder as text_encoder_arch
+import audio_text_retrieval_models.audio_text_model as module_arch
 
 tokenizer_cache = {
     "prajjwal1/bert-medium": "/mnt/lustre/sjtu/home/xnx98/work/AudioTextPretrain/bert_cache/bert_medium_tokenizer",
@@ -33,10 +33,9 @@ def get_model(config):
     return model
 
 
-def load_text_encoder(experiment_path):
+def load_text_encoder(experiment_path, device):
     experiment_path = Path(experiment_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = load_json_config(experiment_path / "models" / "config.json")
+    config = json.load(open(experiment_path / "models" / "config.json"))
     model = get_model(config["model"])
     checkpoint = torch.load(experiment_path / "models" / "trained_model.pth",
                             "cpu")
@@ -58,7 +57,6 @@ def load_text_encoder(experiment_path):
 
 class Executor(object):
 
-
     def phrase(self,
                experiment_path,
                phrase_input,
@@ -68,7 +66,7 @@ class Executor(object):
                with_proj=False):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        ckpt = load_text_encoder(experiment_path)
+        ckpt = load_text_encoder(experiment_path, device)
         model = ckpt["model"]
         tokenizer = ckpt["tokenizer"]
         config = ckpt["config"]
@@ -85,7 +83,6 @@ class Executor(object):
                     break
 
         phrases = list(set(phrases))
-        phrases.append("the toilet has flushed")
 
         phrase_to_emb = {}
 
@@ -110,7 +107,6 @@ class Executor(object):
 
         pickle.dump(phrase_to_emb, open(output, "wb"))
 
-
     def add_phrase(self,
                    experiment_path,
                    extra_phrase,
@@ -120,7 +116,7 @@ class Executor(object):
                    with_proj=False):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        ckpt = load_text_encoder(experiment_path)
+        ckpt = load_text_encoder(experiment_path, device)
         model = ckpt["model"]
         tokenizer = ckpt["tokenizer"]
         config = ckpt["config"]
@@ -154,7 +150,6 @@ class Executor(object):
 
         pickle.dump(phrase_to_emb, open(output, "wb"))
 
-
     def label(self,
               experiment_path,
               label_encoder_input,
@@ -162,7 +157,7 @@ class Executor(object):
               batch_size=128,
               with_proj=False):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        ckpt = load_text_encoder(experiment_path)
+        ckpt = load_text_encoder(experiment_path, device)
         model = ckpt["model"]
         tokenizer = ckpt["tokenizer"]
         config = ckpt["config"]

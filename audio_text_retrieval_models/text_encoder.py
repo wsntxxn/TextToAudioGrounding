@@ -9,10 +9,7 @@ from transformers import AutoModel, AutoTokenizer
 class Bert(nn.Module):
     def __init__(self, model_type):
         super().__init__()
-        self.model = AutoModel.from_pretrained(model_type, proxies={
-            "http": "http://cu01:14227",
-            "https": "http://cu01:14227",
-        })
+        self.model = AutoModel.from_pretrained(model_type)
         self.embed_dim = self.model.config.hidden_size
 
     def forward(self, **tokens):
