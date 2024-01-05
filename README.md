@@ -32,13 +32,14 @@ pip install -r requirements.txt
 2. download audio clips and labels from Zenodo.
 3. pack waveforms, assume the audio files are in `$AUDIO`:
 ```bash
-mkdir data/audiogrounding && cd data/audiogrounding
+mkdir data/audiogrounding
 for split in train val test; do
-  python prepare_wav_csv.py $AUDIO/$split $split/wav.csv
-  python pack_waveform.py $split/wav.csv -o $split/waveform.h5 --sample_rate 32000
+  python utils/data/prepare_wav_csv.py $AUDIO/$split data/audiogrounding/$split/wav.csv
+  python utils/data/pack_waveform.py data/audiogrounding/$split/wav.csv \
+      -o data/audiogrounding/$split/waveform.h5 \
+      --sample_rate 32000
 done
-python prepare_duration.py test/wav.csv test/duration.csv
-cd ../..
+python utils/data/prepare_duration.py data/audiogrounding/test/wav.csv data/audiogrounding/test/duration.csv
 ```
 4. prepare vocabulary file:
 ```bash
@@ -46,12 +47,17 @@ python utils/build_vocab.py data/audiogrounding/train/label.json data/audiogroun
 ```
 5. run the training and evaluation:
 ```bash
-python python_scripts/training/run_strong.py train_evaluate $TRAIN_CFG $EVAL_CFG
+python python_scripts/training/run_strong.py train_evaluate \
+    --train_config $TRAIN_CFG \
+    --eval_config $EVAL_CFG
 ```
 Or alternatively,
 ```bash
-python python_scripts/training/run_strong.py train $TRAIN_CFG
-python python_scripts/training/run_strong.py evaluate $EXP_PATH $EVAL_CFG
+python python_scripts/training/run_strong.py train \
+    --config $TRAIN_CFG
+python python_scripts/training/run_strong.py evaluate \
+    --experiment_path $EXP_PATH \
+    --eval_config $EVAL_CFG
 ```
 `$TRAIN_CFG` and `$EVAL_CFG` are yaml-formatted configuration files.
 `$EXP_PATH` is the checkpoint directory set in `$TRAIN_CFG`.
@@ -65,7 +71,7 @@ We provide the best-performing WSTAG model, downloaded [here](https://drive.goog
 ```bash
 unzip audiocaps_cnn8rnn_w2vmean_dp_ls_clustering_selfsup.zip -d $MODEL_DIR
 ```
-Remember to modify the training data vocabulary path in `$MODEL_DIR/config.yaml` (data.train.collate_fn.tokenizer.args.vocabulary) to `$MODEL_DIR/vocab.pkl`.
+Remember to modify the training data vocabulary path in `$MODEL_DIR/config.yaml` (*data.train.collate_fn.tokenizer.args.vocabulary*) to `$MODEL_DIR/vocab.pkl`.
 To ensure that the vocabulary file used for training is loaded for inference, the inference script uses the vocabulary path specified in `$MODEL_DIR/config.yaml`.
 
 
@@ -80,9 +86,11 @@ python python_scripts/inference/inference.py inference_multi_text_model \
 
 ### Training
 
-All training is done in the same way as in the baseline:
+For all settings, training is done in the same way as in the baseline:
 ```bash
-python $TRAIN_SCRIPT train_evaluate $TRAIN_CFG $EVAL_CFG
+python $TRAIN_SCRIPT train_evaluate \
+    --train_config $TRAIN_CFG \
+    --eval_config $EVAL_CFG
 ```
 The training scripts and configurations vary for different settings.
 We provide the training script and example configuration file in each setting.
@@ -91,6 +99,8 @@ We provide the training script and example configuration file in each setting.
 WSTAG uses audio captioning data for training.
 The format of training data is the same as *AudioGrounding*, with the only difference that there is no `segments` in `phrase_item`.
 You can convert the original captioning data into this format by yourself.
+The phrase parsing rules are provided [here](utils/data/phrase_parser.py).
+The waveform packing and vocabulary preparation process is also the same as in the baseline.
 
 #### Sentence-level WSTAG
 * `TRAIN_SCRIPT`: [run_weak_sentence.py](python_scripts/training/run_weak_sentence.py)
@@ -100,29 +110,47 @@ You can convert the original captioning data into this format by yourself.
 #### Phrase-level WSTAG
 
 For all phrase-level settings, the example `EVAL_CFG` is [eval.yaml](eg_configs/weakly_supervised/audiocaps/phrase_level/eval.yaml).
+For all phrase-level settings except "X + self-supervision", `TRAIN_SCRIPT` is [run_weak_phrase.py](python_scripts/training/run_weak_phrase.py).
 
 ##### random sampling
 
-* `TRAIN_SCRIPT`: [run_weak_phrase.py](python_scripts/training/run_weak_phrase.py)
 * `TRAIN_CFG`: [cnn8rnn_w2vmean_random.yaml](eg_configs/weakly_supervised/audiocaps/phrase_level/cnn8rnn_w2vmean_random.yaml)
 
 ##### similarity-based sampling
 
-* `TRAIN_SCRIPT`: [run_weak_phrase.py](python_scripts/training/run_weak_phrase.py)
-* `TRAIN_CFG`: [cnn8rnn_w2vmean_random.yaml](eg_configs/weakly_supervised/audiocaps/phrase_level/cnn8rnn_w2vmean_similarity.yaml)
+* `TRAIN_CFG`: [cnn8rnn_w2vmean_similarity.yaml](eg_configs/weakly_supervised/audiocaps/phrase_level/cnn8rnn_w2vmean_similarity.yaml)
 
-similarity-based sampling requires pre-computed phrase embeddings.
-To be updated...
+Similarity-based sampling requires pre-computed phrase embeddings.
+We use the contrastive audio-text model trained on AudioCaps to extract phrase embeddings.
+Download the model from [here](https://drive.google.com/file/d/13Iz0AOcbXc8JAmELLGMoD0BI1BadxMV4/view?usp=drive_link), unzip it into `$CLAP_DIR`, then extract embeddings:
+```bash
+unzip audiocaps_cnn14_bertm.zip -d $CLAP_DIR
+python utils/data/create_text_embedding/prepare_phrase_clap.py phrase \
+    --experiment_path $CLAP_DIR \
+    --phrase_input $DATA \
+    --output $OUTPUT \
+    --with_proj True
+```
+Then modify the *data.train.dataset.args.phrase_embed* item in the training configuration file to `$OUTPUT` accordingly.
 
 ##### clustering-based sampling
 
-* `TRAIN_SCRIPT`: [run_weak_phrase.py](python_scripts/training/run_weak_phrase.py)
 * `TRAIN_CFG`: [cnn8rnn_w2vmean_clustering.yaml](eg_configs/weakly_supervised/audiocaps/phrase_level/cnn8rnn_w2vmean_clustering.yaml)
 
-clustering-based sampling requires clustering models.
-To be updated...
+Clustering-based sampling requires clustering models.
+We train clustering models based on the pre-computed phrase embeddings.
+```bash
+python python_scripts/clustering/kmeans_emb.py \
+    --embedding $PHRASE_EMB \
+    --n_cluster $N_CLUSTER \
+    --output $OUTPUT
+```
+`$PHRASE_EMB` is the phrase embedding file, i.e., `$OUTPUT` of the previous step.
+Remember to modify the *data.train.dataset.args.cluster_map* to the corresponding mapping file (not exactly `$OUTPUT`).
 
-##### (any sampling) + self-supervision
+##### X (any sampling) + self-supervision
 
 * `TRAIN_SCRIPT`: [run_weak_phrase_self_supervision.py](python_scripts/training/run_weak_phrase_self_supervision.py)
-* `TRAIN_CFG`: [cnn8rnn_w2vmean_random.yaml](eg_configs/weakly_supervised/audiocaps/phrase_level/cnn8rnn_w2vmean_clustering_self_supervision.yaml)
+* `TRAIN_CFG`: [cnn8rnn_w2vmean_clustering_selfsup.yaml](eg_configs/weakly_supervised/audiocaps/phrase_level/cnn8rnn_w2vmean_clustering_selfsup.yaml)
+
+The *teacher.pretrained* should be set to the checkpoint path of the pretrained WSTAG model.
