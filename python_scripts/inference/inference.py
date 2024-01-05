@@ -45,7 +45,7 @@ class Runner:
         train_util.load_pretrained_model(model, ckpt, output_fn=print_pass)
         model = model.to(device)
         
-        vocabulary = config["data"]["train"]["dataset"]["args"]["vocabulary"]
+        vocabulary = config["data"]["train"]["collate_fn"]["tokenizer"]["args"]["vocabulary"]
         vocabulary = pickle.load(open(vocabulary, "rb"))
         waveform, _ = librosa.core.load(audio, sr=sample_rate)
         duration = waveform.shape[0] / sample_rate
