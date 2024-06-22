@@ -189,6 +189,11 @@ class Runner(object):
             yaml.dump(self.config, writer, default_flow_style=False, indent=4)
 
         self.logger = train_util.init_logger(exp_dir / "train.log")
+        if "SLURM_JOB_ID" in os.environ:
+            self.logger.info(f"Slurm job id: {os.environ['SLURM_JOB_ID']}")
+            self.logger.info(f"Slurm node: {os.environ['SLURM_JOB_NODELIST']}")
+        elif "JobID" in os.environ:
+            self.logger.info(f"Job ID: {os.environ['JobID']}")
         train_util.pprint_dict(self.config, self.logger.info)
 
         self.train_loader = self.get_train_dataloader()

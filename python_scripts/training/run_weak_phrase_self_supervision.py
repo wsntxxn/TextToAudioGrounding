@@ -96,6 +96,8 @@ class Runner(Base):
         if "SLURM_JOB_ID" in os.environ:
             self.logger.info(f"Slurm job id: {os.environ['SLURM_JOB_ID']}")
             self.logger.info(f"Slurm node: {os.environ['SLURM_JOB_NODELIST']}")
+        elif "JobID" in os.environ:
+            self.logger.info(f"Job ID: {os.environ['JobID']}")
         train_util.pprint_dict(self.config, self.logger.info)
 
         self.train_loader = self.get_train_dataloader()

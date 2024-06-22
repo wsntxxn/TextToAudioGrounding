@@ -55,14 +55,16 @@ class HuggingFaceTokenizer:
     
     def __init__(self, model_type, max_length=30) -> None:
         from transformers import AutoTokenizer
-        tokenizer_cache = {
-            "prajjwal1/bert-medium": "/mnt/lustre/sjtu/home/xnx98/work/AudioTextPretrain/bert_cache/bert_medium_tokenizer",
-            "bert-base-uncased": "/mnt/lustre/sjtu/home/xnx98/work/AudioTextPretrain/bert_cache/bert_base_uncased_tokenizer"
+        model_type_to_cache = {
+            "bert-base-uncased": "/hpc_stor03/sjtu_home/xuenan.xu/tools/hf_cache/tokenizer/bert-base-uncased"
         }
         try:
-            self.core = AutoTokenizer.from_pretrained(model_type)
+            self.core = AutoTokenizer.from_pretrained(model_type, proxies={
+                "http": "http://d6-hpc-debuggpu-001:14227",
+                "https": "http://d6-hpc-debuggpu-001:14227",
+            })
         except:
-            self.core = AutoTokenizer.from_pretrained(tokenizer_cache[model_type])
+            self.core = AutoTokenizer.from_pretrained(model_type_to_cache[model_type])
         self.max_length = max_length
 
     def __call__(self, texts):

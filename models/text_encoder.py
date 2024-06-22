@@ -64,7 +64,7 @@ class EmbeddingAgg(nn.Module):
                  aggregation: str = "mean"):
         super().__init__()
         self.embedding = EmbeddingLayer(vocab_size, embed_dim,
-            pretrained_embedding, freeze_embedding)
+                                        pretrained_embedding, freeze_embedding)
         self.embed_dim = self.embedding.embed_dim
         self.agg = aggregation
         if aggregation == "attention":
@@ -79,14 +79,11 @@ class EmbeddingAgg(nn.Module):
             out = self.attn(embs, lens)
         else:
             raise Exception(f"{self.agg} not supported")
-        return {
-            "token_emb": embs,
-            "seq_emb": out
-        }
+        return {"token_emb": embs, "seq_emb": out}
 
 
 class RnnEncoder(nn.Module):
-    
+
     def __init__(self,
                  vocab_size,
                  embed_dim,
@@ -99,40 +96,36 @@ class RnnEncoder(nn.Module):
         super().__init__()
         self.embedding = EmbeddingLayer(vocab_size, embed_dim)
         assert rnn_type in ("RNN", "GRU", "LSTM")
-        self.rnn = getattr(nn.modules.rnn, rnn_type)(
-            input_size=embed_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
+        self.rnn = getattr(nn.modules.rnn,
+                           rnn_type)(input_size=embed_dim,
+                                     hidden_size=hidden_dim,
+                                     num_layers=num_layers,
+                                     batch_first=True,
+                                     dropout=dropout,
+                                     bidirectional=bidirectional)
         self.embed_dim = hidden_dim * (bidirectional + 1)
         self.pooling = pooling
 
-    
     def forward(self, input_dict):
         x = self.embedding(input_dict)
-        token_emb, h = self.rnn(x) # token_emb: (bs, token_num, hid_dim(*2) )
-        
+        token_emb, h = self.rnn(x)  # token_emb: (bs, token_num, hid_dim(*2) )
+
         text_len = torch.as_tensor(input_dict["text_len"])
         if self.pooling == "mean":
             seq_emb = mean_with_lens(token_emb, text_len)
 
-        return {
-            "token_emb": token_emb,
-            "seq_emb": seq_emb
-        }
+        return {"token_emb": token_emb, "seq_emb": seq_emb}
 
 
 class PositionalEncoding(nn.Module):
+
     def __init__(self, d_model, dropout, max_len=100):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) *
-                             -(math.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
@@ -144,10 +137,11 @@ class PositionalEncoding(nn.Module):
 
 
 class ConvGRUCell(nn.Module):
+
     def __init__(self, input_size, hidden_size, kernel_size=1):
-        super(ConvGRUCell,self).__init__()
-        self.input_size  = input_size
-        self.cuda_flag   = True
+        super(ConvGRUCell, self).__init__()
+        self.input_size = input_size
+        self.cuda_flag = True
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.reset_gate = nn.Linear(input_size + hidden_size, hidden_size)
@@ -179,7 +173,8 @@ class ConvGRUCell(nn.Module):
         stacked_inputs = torch.cat([input_, prev_state], dim=2)
         update = torch.sigmoid(self.update_gate(stacked_inputs))
         reset = torch.sigmoid(self.reset_gate(stacked_inputs))
-        out_inputs = torch.tanh(self.out_gate(torch.cat([input_, prev_state * reset], dim=2)))
+        out_inputs = torch.tanh(
+            self.out_gate(torch.cat([input_, prev_state * reset], dim=2)))
         new_state = prev_state * (1 - update) + out_inputs * update
 
         return new_state
@@ -207,12 +202,14 @@ class IntraAttention(nn.Module):
         batch_size, max_len, emb_dim = x.size()
 
         for _ in range(self.num_layers):
-            score = torch.bmm(self.pe(x), torch.transpose(self.pe(x), 1, 2).contiguous())
+            score = torch.bmm(self.pe(x),
+                              torch.transpose(self.pe(x), 1, 2).contiguous())
             len = torch.as_tensor(len)
             mask1 = torch.arange(max_len).repeat(max_len * batch_size).view(
                 batch_size, max_len, max_len) < len.view(-1, 1, 1)
             mask2 = torch.arange(max_len).repeat(max_len * batch_size).view(
-                batch_size, max_len, max_len).transpose(1, 2) < len.view(-1, 1, 1)
+                batch_size, max_len,
+                max_len).transpose(1, 2) < len.view(-1, 1, 1)
             mask = mask1 * mask2
             mask = mask.to(score.device)
             score = score.masked_fill(mask == 0, 1e-10)
@@ -224,10 +221,7 @@ class IntraAttention(nn.Module):
         if self.pooling == "mean":
             seq_emb = mean_with_lens(x, len)
 
-        return {
-            "token_emb": x,
-            "seq_emb": seq_emb
-        }
+        return {"token_emb": x, "seq_emb": seq_emb}
 
 
 class SelfAttention(nn.Module):
@@ -242,9 +236,11 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.embedding = EmbeddingLayer(vocab_size, embed_dim,
-            pretrained_embedding, freeze_embedding)
+                                        pretrained_embedding, freeze_embedding)
         self.pe = PositionalEncoding(embed_dim, dropout)
-        self.mha = nn.MultiheadAttention(embed_dim, num_heads, dropout,
+        self.mha = nn.MultiheadAttention(embed_dim,
+                                         num_heads,
+                                         dropout,
                                          batch_first=True)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
@@ -255,41 +251,26 @@ class SelfAttention(nn.Module):
         lens = torch.as_tensor(input_dict["text_len"]) + 1
         padding_mask = ~generate_length_mask(lens).to(x.device)
         x, attn = self.mha(x, x, x, padding_mask)
-        return {
-            "token_emb": x[:, 1:],
-            "seq_emb": x[:, 0]
-        }
+        return {"token_emb": x[:, 1:], "seq_emb": x[:, 0]}
 
 
 class Bert(nn.Module):
 
-    def __init__(self, model_type, max_length):
+    def __init__(self, model_type):
         super().__init__()
-        from transformers import AutoModel, AutoTokenizer
-        tokenizer_cache = {
-            "prajjwal1/bert-medium": "/mnt/lustre/sjtu/home/xnx98/work/AudioTextPretrain/bert_cache/bert_medium_tokenizer",
-            "bert-base-uncased": "/mnt/lustre/sjtu/home/xnx98/work/AudioTextPretrain/bert_cache/bert_base_uncased_tokenizer"
-        }
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_type)
-        except:
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_cache[model_type])
-        self.model = AutoModel.from_pretrained(model_type, proxies={
-            "http": "http://cu01:14227",
-            "https": "http://cu01:14227",
-        })
+        from transformers import AutoModel
+        self.model = AutoModel.from_pretrained(model_type)
         self.dummy_param = nn.Parameter(torch.zeros(1))
-        self.max_length = max_length
         self.embed_dim = self.model.config.hidden_size
 
     def load_pretrained(self, pretrained, output_fn):
         pass
 
-    def forward(self, text):
-        tokens = self.tokenizer(text, padding="max_length", return_tensors="pt",
-                                truncation=True, max_length=self.max_length)
-        for k in tokens:
-            tokens[k] = tokens[k].to(self.dummy_param.device)
+    def forward(self, input_dict):
+        required_keys = ["input_ids", "token_type_ids", "attention_mask"]
+        tokens = {k: input_dict[k] for k in required_keys}
+        for k in ["input_ids", "token_type_ids"]:
+            tokens[k] = tokens[k].long()
         output = self.model(**tokens)
         # [CLS] pooling
         text_emb = output.last_hidden_state[:, 0, :]
@@ -314,9 +295,4 @@ class SentenceBert(nn.Module):
         for k in tokens:
             tokens[k] = tokens[k].to(self.dummy_param.device)
         output = self.model(tokens)
-        return {
-            "seq_emb": output["sentence_embedding"],
-            "token_emb": output
-        }
-
-
+        return {"seq_emb": output["sentence_embedding"], "token_emb": output}

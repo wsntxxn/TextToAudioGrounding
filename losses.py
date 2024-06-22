@@ -225,14 +225,15 @@ class VectorQuantizeLoss(nn.Module):
 
 class MaxMarginRankingLoss(nn.Module): # triplet weighted
 
-    def __init__(self, margin=1, fix_norm=True, lamda1=1):
+    def __init__(self, margin=1, fix_norm=True, lamda1=1, sim_key="sim"):
         super().__init__()
         self.fix_norm = fix_norm
         self.margin = margin
         self.lamda1 = lamda1
+        self.sim_key = sim_key
 
     def forward(self, x):
-        x = x["sim"]
+        x = x[self.sim_key]
         n = x.size()[0]
 
         x1 = torch.diag(x)
@@ -411,3 +412,29 @@ class WeightedTripletLoss(nn.Module):
         loss = self.polyloss(scores, label)
         return loss
 
+
+class MultipleLossSum(torch.nn.Module):
+
+    def __init__(self,
+                 names,
+                 weights,
+                 **loss_fns):
+        super().__init__()
+        self.names = names
+        self.weights = weights
+        for name, loss_fn in loss_fns.items():
+            self.add_module(name, loss_fn)
+
+    def forward(self, output: Dict):
+        # verbose = output.get("verbose", True)
+        tot_loss = 0
+        for name, weight in zip(self.names, self.weights):
+            if name in output:
+                loss = output[name]
+            else:
+                loss = getattr(self, name)(output)
+            tot_loss += weight * loss
+            # if self.training and verbose and wandb.run is not None:
+            #     wandb.log({f"train/{name}": loss.item()},
+            #               step=output["step"])
+        return tot_loss

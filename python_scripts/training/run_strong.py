@@ -7,9 +7,11 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm import trange, tqdm
-# from sklearn.metrics import precision_recall_fscore_support
 import yaml
 
+import sys
+import os
+sys.path.insert(1, os.getcwd())
 import utils.train_util as train_util
 import utils.eval_util as eval_util
 from utils.build_vocab import Vocabulary
@@ -165,45 +167,6 @@ class Runner(object):
             "loss": np.mean(loss_history),
         }
 
-    # def eval_epoch(self):
-        # labels = []
-        # preds = []
-        # loss_history = []
-
-        # self.model.eval()
-        # with torch.no_grad():
-            # for batch in tqdm(self.val_loader, ascii=True,
-                              # ncols=100, leave=False):
-                # output = self.forward(batch, training=False)
-                # label = batch["label"]
-                # prob = output["prob"]
-                # truncated_length = min(prob.size(1), label.size(1))
-                # prob = prob[..., :truncated_length]
-                # label = label[..., :truncated_length]
-                # length = torch.clamp(output["length"], 1, truncated_length)
-                # output.update({
-                    # "prob": prob,
-                    # "label": label,
-                    # "length": length
-                # })
-                # loss = self.loss_fn(output)
-                # loss_history.append(loss.item())
-                # label = train_util.pack_length(label, length)
-                # prob = train_util.pack_length(prob, length)
-                # labels.append(label.cpu().numpy())
-                # preds.append(torch.round(prob).cpu().numpy())
-
-        # preds = np.concatenate(preds)
-        # labels = np.concatenate(labels)
-        # result = precision_recall_fscore_support(labels, preds, average="macro")
-        # precision, recall, f1, _ = result
-        
-        # return {
-            # "loss": np.mean(loss_history),
-            # "precision": precision,
-            # "recall": recall,
-            # "f1": f1
-        # }
 
     def eval_inference(self, dataloader):
         import sed_scores_eval
@@ -259,7 +222,10 @@ class Runner(object):
                     fname = f"{audiocap_id}_{start_index}"
                     if fname not in gt_df["filename"].unique():
                         continue
-                    scores_arr = output["frame_sim"][idx].unsqueeze(-1).cpu().numpy()
+                    scores_arr = output["frame_sim"][idx]
+                    if scores_arr.ndim == 1:
+                        scores_arr = scores_arr.unsqueeze(-1)
+                    scores_arr = scores_arr.cpu().numpy()
                     timestamps = np.arange(output["frame_sim"].shape[1] + 1) * \
                         time_resolution
                     score_buffer[fname] = sed_scores_eval.utils.create_score_dataframe(
@@ -762,11 +728,15 @@ class Runner(object):
             yaml.dump(self.config, writer, default_flow_style=False, indent=4)
 
         self.logger = train_util.init_logger(exp_dir / "train.log")
+        if "SLURM_JOB_ID" in os.environ:
+            self.logger.info(f"Slurm job id: {os.environ['SLURM_JOB_ID']}")
+            self.logger.info(f"Slurm node: {os.environ['SLURM_JOB_NODELIST']}")
+        elif "JobID" in os.environ:
+            self.logger.info(f"Job ID: {os.environ['JobID']}")
         train_util.pprint_dict(self.config, self.logger.info)
 
         self.train_loader = self.get_train_dataloader()
         self.val_loader = self.get_val_dataloader()
-        # self.test_loader = self.get_test_dataloader()
         self.model = self.get_model(self.logger.info).to(self.device)
         train_util.pprint_dict(self.model, self.logger.info, format="pretty")
         num_params = train_util.count_parameters(self.model)
@@ -798,7 +768,7 @@ class Runner(object):
         self.iteration = 1
         self.not_improve_cnt = 0
         self.train_iter = iter(self.train_loader)
-        
+
         if not hasattr(self, "epoch_length"):
             self.epoch_length = len(self.train_loader)
 
@@ -806,7 +776,7 @@ class Runner(object):
             train_output = self.train_epoch()
             val_result = self.val_epoch()
 
-        
+
             val_score = val_result[self.metric_monitor["name"]]
 
             if self.lr_update_interval == "epoch":
@@ -845,16 +815,15 @@ class Runner(object):
         eval_config = train_util.parse_config_or_kwargs(eval_config)
 
         exp_dir = Path(experiment_path)
-        self.config = train_util.parse_config_or_kwargs(exp_dir / "config.yaml" )
+        self.config = train_util.parse_config_or_kwargs(exp_dir / "config.yaml")
         self.config["resume"] = exp_dir / eval_config["resume"]
         self.model = self.get_model(print)
         self.resume_checkpoint(finetune=True)
         
-        key_copy_from_train = ["vocabulary"]
-        for key in key_copy_from_train:
-            if key in self.config["data"]["train"]["dataset"]["args"]:
-                eval_config["data"]["test"]["dataset"]["args"][
-                    key] = self.config["data"]["train"]["dataset"]["args"][key]
+        key_copy_from_train = ["vocabulary", "model_type"]
+        train_util.copy_args_recursive(self.config["data"]["train"],
+                                       eval_config["data"]["test"],
+                                       key_copy_from_train)
 
         dataset = train_util.init_obj_from_str(
             eval_config["data"]["test"]["dataset"])
