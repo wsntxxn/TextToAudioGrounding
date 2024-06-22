@@ -2,6 +2,42 @@
 
 This repository provides the data and source code for Text-to-Audio Grounding (TAG) task.
 
+## Quick start of inference using Hugging Face🤗
+We provide a quick inference usage with Hugging Face:
+```python
+import torch
+import torchaudio
+from transformers import AutoModel
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = AutoModel.from_pretrained(
+    "wsntxxn/cnn8rnn-w2vmean-audiocaps-grounding",
+    trust_remote_code=True
+).to(device)
+
+wav1, sr1 = torchaudio.load("/path/to/file1.wav")
+wav1 = torchaudio.functional.resample(wav1, sr1, model.config.sample_rate)
+wav1 = wav1.mean(0) if wav1.size(0) > 1 else wav1[0]
+
+wav2, sr2 = torchaudio.load("/path/to/file2.wav")
+wav2 = torchaudio.functional.resample(wav2, sr2, model.config.sample_rate)
+wav2 = wav2.mean(0) if wav2.size(0) > 1 else wav2[0]
+
+wav_batch = torch.nn.utils.rnn.pad_sequence([wav1, wav2], batch_first=True)
+
+text = ["a man speaks", "a dog is barking"]
+
+with torch.no_grad():
+    output = model(
+        audio=wav_batch,
+        audio_length=[wav1.size(0), wav2.size(0)],
+        text=text
+    )
+    # output: (2, n_seconds // 4)
+```
+`output` gives the estimated probability of the input text prompt.
+
 ## Data
 
 The *AudioGrounding* dataset is an augmented audio captioning dataset. It is based on [AudioCaps](https://www.aclweb.org/anthology/N19-1011.pdf), which is established using part of a audio event dataset, [AudioSet](https://research.google.com/audioset). Therefore, audio files can be downloaded from [AudioSet](https://research.google.com/audioset/download.html). 
@@ -154,3 +190,26 @@ Remember to modify the *data.train.dataset.args.cluster_map* to the correspondin
 * `TRAIN_CFG`: [cnn8rnn_w2vmean_clustering_selfsup.yaml](eg_configs/weakly_supervised/audiocaps/phrase_level/cnn8rnn_w2vmean_clustering_selfsup.yaml)
 
 The *teacher.pretrained* should be set to the checkpoint path of the pretrained WSTAG model.
+
+## Citation
+
+If you find the data useful, please cite our paper:
+```BibTeX
+@inproceedings{xu2021text,
+    title={Text-to-audio grounding: Building correspondence between captions and sound events},
+    author={Xu, Xuenan and Dinkel, Heinrich and Wu, Mengyue and Yu, Kai},
+    booktitle={IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+    pages={606--610},
+    year={2021},
+    organization={IEEE}
+}
+```
+If you find the pre-trained WSTAG model useful, please cite this paper:
+```BibTeX
+@article{xu2024towards,
+    title={Towards Weakly Supervised Text-to-Audio Grounding},
+    author={Xu, Xuenan and Ma, Ziyang and Wu, Mengyue and Yu, Kai},
+    journal={arXiv preprint arXiv:2401.02584},
+    year={2024}
+}
+``` 

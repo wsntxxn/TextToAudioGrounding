@@ -1,5 +1,6 @@
 import sys
 import os
+
 sys.path.append(os.getcwd())
 
 from pathlib import Path
@@ -33,7 +34,7 @@ class Runner:
                                     phrase,
                                     output,
                                     sample_rate=32000):
-        
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         device = torch.device(device)
 
@@ -44,8 +45,9 @@ class Runner:
         ckpt = torch.load(exp_dir / "best.pth", "cpu")
         train_util.load_pretrained_model(model, ckpt, output_fn=print_pass)
         model = model.to(device)
-        
-        vocabulary = config["data"]["train"]["collate_fn"]["tokenizer"]["args"]["vocabulary"]
+
+        vocabulary = config["data"]["train"]["collate_fn"]["tokenizer"][
+            "args"]["vocabulary"]
         vocabulary = pickle.load(open(vocabulary, "rb"))
         waveform, _ = librosa.core.load(audio, sr=sample_rate)
         duration = waveform.shape[0] / sample_rate
@@ -64,22 +66,25 @@ class Runner:
             model_output = model(input_dict)
         prob = model_output["prob"].squeeze(0).cpu().numpy()
 
-        filtered_prob = eval_util.median_filter(
-            prob[None, :], window_size=1, threshold=0.5)[0]
+        filtered_prob = eval_util.median_filter(prob[None, :],
+                                                window_size=1,
+                                                threshold=0.5)[0]
         change_indices = eval_util.find_contiguous_regions(filtered_prob)
-        time_resolution = config["data"]["train"]["dataset"]["args"]["time_resolution"]
+        time_resolution = config["data"]["train"]["dataset"]["args"][
+            "time_resolution"]
         results = []
         for row in change_indices:
             onset = row[0] * time_resolution
             offset = row[1] * time_resolution
             results.append([onset, offset])
         print(results)
-        
+
         plt.figure(figsize=(14, 5))
         plt.plot(prob)
         plt.axhline(y=0.5, color='r', linestyle='--')
         xlabels = [f"{x:.2f}" for x in np.arange(0, duration, duration / 5)]
-        plt.xticks(ticks=np.arange(0, len(prob), len(prob) / 5),
+        plt.xticks(ticks=np.arange(0, len(prob),
+                                   len(prob) / 5),
                    labels=xlabels,
                    fontsize=15)
         plt.xlabel("Time / second", fontsize=14)
@@ -89,7 +94,6 @@ class Runner:
             Path(output).parent.mkdir(parents=True)
         plt.savefig(output, bbox_inches="tight", dpi=150)
 
-
     def inference_multi_text_model(self,
                                    experiment_path,
                                    audio,
@@ -97,7 +101,7 @@ class Runner:
                                    output,
                                    sample_rate=32000,
                                    threshold=0.5):
-        
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         device = torch.device(device)
 
@@ -108,8 +112,9 @@ class Runner:
         ckpt = torch.load(exp_dir / "best.pth", "cpu")
         train_util.load_pretrained_model(model, ckpt, output_fn=print_pass)
         model = model.to(device)
-        
-        vocab_path = config["data"]["train"]["collate_fn"]["tokenizer"]["args"]["vocabulary"]
+
+        vocab_path = config["data"]["train"]["collate_fn"]["tokenizer"][
+            "args"]["vocabulary"]
         vocabulary = Vocabulary()
         vocabulary.load_state_dict(pickle.load(open(vocab_path, "rb")))
 
@@ -130,8 +135,9 @@ class Runner:
             model_output = model(input_dict)
         prob = model_output["frame_sim"][0, :, 0].cpu().numpy()
 
-        filtered_prob = eval_util.median_filter(
-            prob[None, :], window_size=1, threshold=threshold)[0]
+        filtered_prob = eval_util.median_filter(prob[None, :],
+                                                window_size=1,
+                                                threshold=threshold)[0]
         change_indices = eval_util.find_contiguous_regions(filtered_prob)
         time_resolution = model.audio_encoder.time_resolution
         results = []
@@ -140,12 +146,13 @@ class Runner:
             offset = row[1] * time_resolution
             results.append([onset, offset])
         print(results)
-        
+
         plt.figure(figsize=(14, 5))
         plt.plot(prob)
         plt.axhline(y=threshold, color='r', linestyle='--')
         xlabels = [f"{x:.2f}" for x in np.arange(0, duration, duration / 5)]
-        plt.xticks(ticks=np.arange(0, len(prob), len(prob) / 5),
+        plt.xticks(ticks=np.arange(0, len(prob),
+                                   len(prob) / 5),
                    labels=xlabels,
                    fontsize=15)
         plt.xlabel("Time / second", fontsize=14)
