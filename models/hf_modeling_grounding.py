@@ -31,7 +31,7 @@ def generate_length_mask(lens, max_length=None):
     N = lens.size(0)
     if max_length is None:
         max_length = max(lens)
-    idxs = torch.arange(max_length).repeat(N).view(N, max_length)
+    idxs = torch.arange(max_length).repeat(N).view(N, max_length).to(lens.device)
     mask = (idxs < lens.view(-1, 1))
     return mask
 

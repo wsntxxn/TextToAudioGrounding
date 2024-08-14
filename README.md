@@ -24,17 +24,17 @@ wav2, sr2 = torchaudio.load("/path/to/file2.wav")
 wav2 = torchaudio.functional.resample(wav2, sr2, model.config.sample_rate)
 wav2 = wav2.mean(0) if wav2.size(0) > 1 else wav2[0]
 
-wav_batch = torch.nn.utils.rnn.pad_sequence([wav1, wav2], batch_first=True)
+wav_batch = torch.nn.utils.rnn.pad_sequence([wav1, wav2], batch_first=True).to(device)
 
 text = ["a man speaks", "a dog is barking"]
 
 with torch.no_grad():
     output = model(
         audio=wav_batch,
-        audio_length=[wav1.size(0), wav2.size(0)],
+        audio_len=[wav1.size(0), wav2.size(0)],
         text=text
     )
-    # output: (2, n_seconds // 4)
+    # output: (2, n_seconds * 25)
 ```
 `output` gives the estimated probability of the input text prompt.
 
