@@ -131,6 +131,8 @@ python $TRAIN_SCRIPT train_evaluate \
 The training scripts and configurations vary for different settings.
 We provide the training script and example configuration file in each setting.
 
+For reproducing our results, [pre-trained audio encoder](https://drive.google.com/file/d/1U-oS8xLGbis0Wrynfb5O_5tPsFZFCOmP/view?usp=drive_link) is also provided. Download it and replace `model.audio_encoder.pretrained` in `$TRAIN_CFG` with the checkpoint path.
+
 #### Data Format
 WSTAG uses audio captioning data for training.
 The format of training data is the same as *AudioGrounding*, with the only difference that there is no `segments` in `phrase_item`.
