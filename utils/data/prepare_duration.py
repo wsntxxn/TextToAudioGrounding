@@ -13,7 +13,7 @@ def extract_duration(row):
     aid = item["audio_id"]
     if "file_name" in item:
         fname = item["file_name"]
-        duration = librosa.core.get_duration(filename=fname)
+        duration = librosa.core.get_duration(path=fname)
     elif "hdf5_path" in item:
         fname = item["hdf5_path"]
         with h5py.File(fname, "r") as hf:
@@ -37,15 +37,15 @@ sample_rate = args.sample_rate
 
 output_data = []
 with tqdm(total=wav_df.shape[0], ascii=True) as pbar:
-    for aid, duration in pr.map(extract_duration,
-                                wav_df.iterrows(),
-                                workers=args.num_workers,
-                                maxsize=4):
-        output_data.append({
-            "audio_id": aid,
-            "duration": duration
-        })
+    for aid, duration in pr.map(
+        extract_duration,
+        wav_df.iterrows(),
+        workers=args.num_workers,
+        maxsize=4
+    ):
+        output_data.append({"audio_id": aid, "duration": duration})
         pbar.update()
 
-pd.DataFrame(output_data).to_csv(args.output, sep="\t",
-                                 index=False, float_format="%.3f")
+pd.DataFrame(output_data).to_csv(
+    args.output, sep="\t", index=False, float_format="%.3f"
+)

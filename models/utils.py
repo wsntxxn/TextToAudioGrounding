@@ -23,8 +23,9 @@ def generate_length_mask(lens, max_length=None):
     lens = torch.as_tensor(lens)
     N = lens.size(0)
     if max_length is None:
-        max_length = max(lens)
+        max_length = int(max(lens).item())
     idxs = torch.arange(max_length).repeat(N).view(N, max_length)
+    idxs = idxs.to(lens.device)
     mask = (idxs < lens.view(-1, 1))
     return mask
 
@@ -36,7 +37,7 @@ def sum_with_lens(features, lens):
         mask = generate_length_mask(lens, max_length)
     else:
         mask = generate_length_mask(lens)
-    mask = mask.to(features.device) # [N, T]
+    mask = mask.to(features.device)  # [N, T]
 
     while mask.ndim < features.ndim:
         mask = mask.unsqueeze(-1)
@@ -63,7 +64,7 @@ def max_with_lens(features, lens):
     lens: [N,]
     """
     lens = torch.as_tensor(lens)
-    mask = generate_length_mask(lens).to(features.device) # [N, T]
+    mask = generate_length_mask(lens).to(features.device)  # [N, T]
 
     feature_max = features.clone()
     feature_max[~mask] = float("-inf")
@@ -72,7 +73,7 @@ def max_with_lens(features, lens):
 
 
 def linear_softmax_with_lens(features, lens):
-    return sum_with_lens(features ** 2, lens) / sum_with_lens(features, lens)
+    return sum_with_lens(features**2, lens) / sum_with_lens(features, lens)
 
 
 def exp_softmax_with_lens(features, lens):
@@ -96,10 +97,9 @@ def mean_by_group(arr, grp_num):
     res = torch.zeros(len(grp_num), *arr.shape[1:]).to(arr.device)
     res.scatter_add_(0, index, arr)
     denominator = torch.as_tensor(grp_num).to(res.device)
-        
+
     while denominator.ndim < res.ndim:
         denominator = denominator.unsqueeze(-1)
 
     res = res / denominator
     return res
-

@@ -6,11 +6,15 @@ import random
 import os
 import logging
 from typing import Dict
+from pathlib import Path
+from typing import Callable
 
 import yaml
 import toml
+import hydra
 import h5py
 import torch
+import torch.nn as nn
 import numpy as np
 import pandas as pd
 from pprint import pformat
@@ -57,7 +61,9 @@ class Mixup(object):
         """
         mixup_lambdas = []
         for n in range(0, batch_size, 2):
-            lam = self.random_state.beta(self.mixup_alpha, self.mixup_alpha, 1)[0]
+            lam = self.random_state.beta(
+                self.mixup_alpha, self.mixup_alpha, 1
+            )[0]
             mixup_lambdas.append(lam)
             mixup_lambdas.append(1. - lam)
 
@@ -75,7 +81,8 @@ def do_mixup(x, mixup_lambdas):
     Returns:
       out: (batch_size, ...)
     """
-    mixup_lambdas = torch.as_tensor(mixup_lambdas, dtype=torch.float).to(x.device)
+    mixup_lambdas = torch.as_tensor(mixup_lambdas,
+                                    dtype=torch.float).to(x.device)
     out = (x[0 :: 2].transpose(0, -1) * mixup_lambdas[0 :: 2] + \
         x[1 :: 2].transpose(0, -1) * mixup_lambdas[1 :: 2]).transpose(0, -1)
     return out
@@ -84,7 +91,8 @@ def do_mixup(x, mixup_lambdas):
 def init_logger(filename, level="INFO"):
     filename = filename.__str__()
     formatter = logging.Formatter(
-        "[ %(levelname)s : %(asctime)s ] - %(message)s")
+        "[ %(levelname)s : %(asctime)s ] - %(message)s"
+    )
     logger = logging.getLogger(__name__ + "." + filename)
     logger.setLevel(getattr(logging, level))
     filehandler = logging.FileHandler(filename)
@@ -107,12 +115,6 @@ def pprint_dict(in_dict, print_fn=sys.stdout.write, format='yaml'):
         raise Exception(f"format {format} not supported")
     for line in format_fn(in_dict).split('\n'):
         print_fn(line)
-
-
-# def init_obj(module, config, **kwargs):
-    # obj_args = config["args"].copy()
-    # obj_args.update(kwargs)
-    # return getattr(module, config["type"])(**obj_args)
 
 
 def get_obj_from_str(string, reload=False):
@@ -152,9 +154,8 @@ def merge_a_into_b(a, b):
     # merge dict a into dict b. values in a will overwrite b.
     for k, v in a.items():
         if isinstance(v, dict) and k in b:
-            assert isinstance(
-                b[k], dict
-            ), "Cannot inherit key '{}' from base!".format(k)
+            assert isinstance(b[k], dict
+                             ), "Cannot inherit key '{}' from base!".format(k)
             merge_a_into_b(v, b[k])
         else:
             b[k] = v
@@ -210,22 +211,72 @@ def pack_length(padded, lengths):
 def pad_sequence(data):
     if isinstance(data[0], np.ndarray):
         data = [torch.as_tensor(arr) for arr in data]
-    padded_seq = torch.nn.utils.rnn.pad_sequence(data,
-                                                 batch_first=True)
-    length = [x.shape[0] for x in data]
+    padded_seq = torch.nn.utils.rnn.pad_sequence(data, batch_first=True)
+    length = torch.as_tensor([x.shape[0] for x in data]).long()
     return padded_seq, length
 
 
-def load_pretrained_model(model,
-                          pretrained,
-                          output_fn=sys.stdout.write,
-                          **load_args):
+def merge_matched_keys(
+    model_dict: 'dict[str, torch.Tensor]',
+    pretrained_dict: 'dict[str, torch.Tensor]',
+    output_fn: Callable = sys.stdout.write,
+    model_name: str = "nn.Module",
+) -> 'dict[str, torch.Tensor]':
+    """
+    Args:
+    model_dict:
+        The state dict of the current model, which is going to load pretrained parameters
+    pretrained_dict:
+        A dictionary of parameters from a pre-trained model.
+
+    Returns:
+        dict[str, torch.Tensor]:
+            The updated state dict, where parameters with matched keys and shape are 
+            updated with values in `state_dict`.
+    """
+    filtered_pretrained_dict = {}
+    mismatch_keys = []
+    for key, value in pretrained_dict.items():
+        if key in model_dict and model_dict[key].shape == value.shape:
+            filtered_pretrained_dict[key] = value
+        else:
+            mismatch_keys.append(key)
+    output_fn(
+        f"Loading pre-trained {model_name}, with mismatched keys {mismatch_keys}\n"
+    )
+    model_dict.update(filtered_pretrained_dict)
+    return model_dict
+
+
+def load_pretrained_base(
+    model: nn.Module,
+    ckpt_or_state_dict: 'str | Path | dict[str, torch.Tensor]',
+    state_dict_process_fn: Callable = merge_matched_keys,
+    output_fn: Callable = sys.stdout.write,
+) -> None:
+    pretrained_dict = ckpt_or_state_dict
+    if not isinstance(ckpt_or_state_dict, dict):
+        pretrained_dict = torch.load(
+            ckpt_or_state_dict, map_location="cpu", weights_only=False
+        )
+
+    model_dict = model.state_dict()
+    state_dict = state_dict_process_fn(
+        model_dict, pretrained_dict, output_fn,
+        type(model).__name__
+    )
+    model.load_state_dict(state_dict)
+
+
+def load_pretrained_model(
+    model, pretrained, output_fn=sys.stdout.write, **load_args
+):
     if not isinstance(pretrained, dict) and not os.path.exists(pretrained):
         output_fn(f"pretrained {pretrained} not exist!")
         return
-    
+
     if hasattr(model, "load_pretrained"):
-        model.load_pretrained(pretrained, output_fn, **load_args)
+        model.load_pretrained(pretrained, output_fn=output_fn, **load_args)
         return
 
     if isinstance(pretrained, dict):
@@ -237,16 +288,42 @@ def load_pretrained_model(model,
         state_dict = state_dict["model"]
     model_dict = model.state_dict()
     pretrained_dict = {
-        k: v for k, v in state_dict.items() if (k in model_dict) and (
-            model_dict[k].shape == v.shape)
+        k: v
+        for k, v in state_dict.items()
+        if (k in model_dict) and (model_dict[k].shape == v.shape)
     }
     output_fn(f"Loading pretrained keys {pretrained_dict.keys()}")
     model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict, strict=True)
 
 
-class MetricImprover:
+def instantiate_model(config: dict, print_fn: Callable):
+    def add_print_fn(cfg: dict):
+        if isinstance(cfg, dict):
+            if "pretrained" in cfg:
+                cfg["output_fn"] = print_fn
+            for key, value in cfg.items():
+                add_print_fn(value)
+        elif isinstance(cfg, list):
+            for item in cfg:
+                add_print_fn(item)
 
+    add_print_fn(config)
+    model = hydra.utils.instantiate(config, _convert_="all")
+    return model
+
+
+def unsqueeze_at_1(x: "list | np.array | torch.Tensor"):
+    if isinstance(x, list):
+        x = np.array(x)
+    if isinstance(x, np.ndarray):
+        x = np.expand_dims(x, axis=1)
+    else:
+        x = x.unsqueeze(1)
+    return x
+
+
+class MetricImprover:
     def __init__(self, mode):
         assert mode in ("min", "max")
         self.mode = mode
@@ -270,7 +347,6 @@ class MetricImprover:
 
 
 class AveragedModel(torch_average_model):
-
     def update_parameters(self, model):
         for p_swa, p_model in zip(self.parameters(), model.parameters()):
             device = p_swa.device
@@ -278,8 +354,11 @@ class AveragedModel(torch_average_model):
             if self.n_averaged == 0:
                 p_swa.detach().copy_(p_model_)
             else:
-                p_swa.detach().copy_(self.avg_fn(p_swa.detach(), p_model_,
-                                                 self.n_averaged.to(device)))
+                p_swa.detach().copy_(
+                    self.avg_fn(
+                        p_swa.detach(), p_model_, self.n_averaged.to(device)
+                    )
+                )
 
         for b_swa, b_model in zip(list(self.buffers())[1:], model.buffers()):
             device = b_swa.device
@@ -287,6 +366,9 @@ class AveragedModel(torch_average_model):
             if self.n_averaged == 0:
                 b_swa.detach().copy_(b_model_)
             else:
-                b_swa.detach().copy_(self.avg_fn(b_swa.detach(), b_model_,
-                                                 self.n_averaged.to(device)))
+                b_swa.detach().copy_(
+                    self.avg_fn(
+                        b_swa.detach(), b_model_, self.n_averaged.to(device)
+                    )
+                )
         self.n_averaged += 1

@@ -5,7 +5,6 @@ from utils.train_util import pad_sequence
 
 
 class VarLenPadCollate:
-
     def __init__(self, pad_keys=[], sort_key=None):
         self.pad_keys = pad_keys
         self.sort_key = sort_key
@@ -13,7 +12,7 @@ class VarLenPadCollate:
     def __call__(self, data_batch):
         if self.sort_key is not None:
             data_batch.sort(key=lambda x: len(x[self.sort_key]), reverse=True)
-        
+
         output = {}
         for data in data_batch:
             for key in data:
@@ -35,13 +34,13 @@ class VarLenPadCollate:
                         output[key] = data
             except Exception:
                 print(f"error occurred when collating {key}")
-                import ipdb; ipdb.set_trace()
+                import ipdb
+                ipdb.set_trace()
 
         return output
 
 
 class TextCollate:
-
     def __init__(self, tokenizer, text_key="text", pad_keys=[], sort_key=None):
         self.tokenizer = tokenizer
         self.pad_keys = pad_keys
@@ -51,7 +50,7 @@ class TextCollate:
     def __call__(self, data_batch):
         if self.sort_key is not None:
             data_batch.sort(key=lambda x: len(x[self.sort_key]), reverse=True)
-        
+
         output = {}
         for data_dict in data_batch:
             for key in data_dict:
@@ -75,15 +74,17 @@ class TextCollate:
                         output[key] = torch.as_tensor(data)
                     else:
                         output[key] = data
-            except Exception:
+            except Exception as e:
+                print(output[key])
                 print(f"error occurred when collating {key}")
-                import ipdb; ipdb.set_trace()
+                print("Error: ", e)
+                import ipdb
+                ipdb.set_trace()
 
         return output
 
 
 class VarNumTextCollate:
-
     def __init__(self, tokenizer, text_key="text", pad_keys=[], sort_key=None):
         self.tokenizer = tokenizer
         self.text_key = text_key
@@ -126,6 +127,7 @@ class VarNumTextCollate:
                         output[key] = data
             except Exception:
                 print(f"error occurred when collating {key}")
-                import ipdb; ipdb.set_trace()
+                import ipdb
+                ipdb.set_trace()
 
         return output

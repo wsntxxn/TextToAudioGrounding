@@ -27,7 +27,7 @@ class Vocabulary(object):
 
     def state_dict(self):
         return self.word2idx
-    
+
     def load_state_dict(self, state_dict):
         self.word2idx = state_dict
         self.idx2word = {idx: word for word, idx in self.word2idx.items()}
@@ -44,7 +44,10 @@ def process(items: List, output: str):
 
     # Add the words to the vocabulary.
     for item in items:
-        tokens = item["tokens"].split()
+        if "tokens" in item:
+            tokens = item["tokens"].split()
+        else:
+            tokens = item["caption"].split()
         for token in tokens:
             vocab.add_word(token)
     pickle.dump(vocab.state_dict(), open(output, "wb"))

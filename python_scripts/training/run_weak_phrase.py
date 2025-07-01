@@ -1,6 +1,4 @@
 import os
-import sys
-sys.path.insert(1, os.getcwd())
 import warnings
 import math
 from pathlib import Path
@@ -11,6 +9,7 @@ import pandas as pd
 import torch
 from tqdm import trange, tqdm
 import yaml
+import hydra
 
 import utils.train_util as train_util
 import utils.eval_util as eval_util
@@ -24,55 +23,18 @@ class Runner(object):
             device = "cuda"
         self.device = torch.device(device)
 
-
     def get_train_dataloader(self):
-        cfg = self.config["data"]["train"]
-        dataset = train_util.init_obj_from_str(cfg["dataset"])
-        collate_fn = train_util.init_obj_from_str(cfg["collate_fn"])
-        kwargs = {
-            "collate_fn": collate_fn,
-            "shuffle": True
-        }
-        kwargs.update(cfg["dataloader_args"])
-        dataloader = torch.utils.data.DataLoader(
-            dataset, **kwargs)
-        return dataloader
-
+        return hydra.utils.instantiate(
+            self.config["data"]["train_dataloader"], _convert_="all"
+        )
 
     def get_val_dataloader(self):
-        cfg = self.config["data"]["val"]
-        dataset = train_util.init_obj_from_str(cfg["dataset"])
-        collate_fn = train_util.init_obj_from_str(cfg["collate_fn"])
-        kwargs = {
-            "collate_fn": collate_fn,
-            "shuffle": False
-        }
-        kwargs.update(cfg["dataloader_args"])
-        dataloader = torch.utils.data.DataLoader(
-            dataset, **kwargs)
-        return dataloader
-
+        return hydra.utils.instantiate(
+            self.config["data"]["val_dataloader"], _convert_="all"
+        )
 
     def get_model(self, print_fn):
-
-        cfg = self.config["model"]
-
-        kwargs = {}
-
-        for k in cfg:
-            if k not in ["type", "args", "pretrained"]:
-                sub_model = train_util.init_obj_from_str(cfg[k])
-                if "pretrained" in cfg[k]:
-                    train_util.load_pretrained_model(
-                        sub_model,
-                        cfg[k]["pretrained"],
-                        print_fn)
-                kwargs[k] = sub_model
-
-        model = train_util.init_obj_from_str(cfg, **kwargs)
-
-        return model
-
+        return train_util.instantiate_model(self.config["model"], print_fn)
 
     def forward(self, batch, training=True):
 
@@ -84,12 +46,10 @@ class Runner(object):
                     batch[k] = v.float().to(self.device)
 
         if not training:
-            batch["text"] = batch["text"].unsqueeze(1)
-            batch["text_len"] = np.array(batch["text_len"])[:, np.newaxis]
+            for key in self.model.text_forward_keys:
+                batch[key] = batch[key].unsqueeze(1)
 
-        input_dict = {
-            "specaug": False
-        }
+        input_dict = {"specaug": False}
         input_dict.update(batch)
         output = self.model(input_dict)
 
@@ -98,14 +58,17 @@ class Runner(object):
 
         return output
 
-
     def train_epoch(self):
         loss_history = []
         self.model.train()
 
-        for iteration in trange(self.epoch_length, ascii=True, ncols=100,
-                                desc=f"Epoch {self.epoch}/{self.epochs}",
-                                leave=False):
+        for iteration in trange(
+            self.epoch_length,
+            ascii=True,
+            ncols=100,
+            desc=f"Epoch {self.epoch}/{self.epochs}",
+            leave=False
+        ):
             try:
                 batch = next(self.train_iter)
             except StopIteration:
@@ -120,35 +83,33 @@ class Runner(object):
             loss = self.loss_fn(output)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.max_grad_norm)
+                self.model.parameters(), self.max_grad_norm
+            )
             if torch.isnan(loss):
                 self.optimizer.zero_grad()
             self.optimizer.step()
-            
+
             if not torch.isnan(loss):
                 loss_history.append(loss.item())
             self.iteration += 1
 
-        return {
-            "loss": np.mean(loss_history)
-        }
-
+        return {"loss": np.mean(loss_history)}
 
     def val_epoch(self):
         loss_history = []
 
         self.model.eval()
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, ascii=True,
-                              ncols=100, leave=False):
+            for batch in tqdm(
+                self.val_loader, ascii=True, ncols=100, leave=False
+            ):
                 output = self.forward(batch, training=True)
                 loss = self.loss_fn(output)
                 loss_history.append(loss.item())
-        
+
         return {
             "loss": np.mean(loss_history),
         }
-
 
     def eval_psds(self, dataloader, data_duration, return_score=True):
 
@@ -172,19 +133,19 @@ class Runner(object):
         ground_truth = pd.DataFrame(ground_truth)
 
         n_thresholds = self.config["eval_config"]["n_thresholds"]
-        thresholds = np.arange(
-            1 / (n_thresholds * 2), 1, 1 / n_thresholds)
+        thresholds = np.arange(1 / (n_thresholds * 2), 1, 1 / n_thresholds)
         psds_buffer = {th: [] for th in thresholds}
 
         window_size = self.config["inference_args"]["window_size"]
-        time_resolution = self.config["data"]["train"]["dataset"][
-            "args"]["time_resolution"]
+        time_resolution = self.config["data"]["train"]["dataset"]["args"][
+            "time_resolution"]
         n_connect = math.ceil(0.5 / time_resolution)
 
         self.model.eval()
         with torch.no_grad():
-            for batch in tqdm(dataloader, unit="batch",
-                              ascii=True, ncols=100, leave=False):
+            for batch in tqdm(
+                dataloader, unit="batch", ascii=True, ncols=100, leave=False
+            ):
                 output = self.forward(batch, training=False)
                 for th in thresholds:
                     filtered_probs = eval_util.median_filter(
@@ -200,8 +161,7 @@ class Runner(object):
                             continue
                         change_indices = eval_util.find_contiguous_regions(
                             eval_util.connect_clusters(
-                                filtered_probs[idx],
-                                n_connect
+                                filtered_probs[idx], n_connect
                             )
                         )
                         for row in change_indices:
@@ -223,13 +183,11 @@ class Runner(object):
                     "offset": []
                 })
             pred_df = eval_util.predictions_to_time(
-                pred_df, ratio=time_resolution)
+                pred_df, ratio=time_resolution
+            )
             psds_buffer[th] = pred_df
 
-        output = {
-            "psds_buffer": psds_buffer,
-            "ground_truth": ground_truth
-        }
+        output = {"psds_buffer": psds_buffer, "ground_truth": ground_truth}
 
         if return_score:
             psds_score = eval_util.compute_psds(
@@ -240,9 +198,8 @@ class Runner(object):
                 gtc_threshold=0.5,
             )
             output["psds"] = psds_score
-        
-        return output
 
+        return output
 
     def eval_th_auc(self, dataloader, return_score=True):
 
@@ -263,19 +220,19 @@ class Runner(object):
         ground_truth = pd.DataFrame(ground_truth)
 
         n_thresholds = self.config["eval_config"]["n_thresholds"]
-        thresholds = np.arange(
-            1 / (n_thresholds * 2), 1, 1 / n_thresholds)
+        thresholds = np.arange(1 / (n_thresholds * 2), 1, 1 / n_thresholds)
         pred_buffer = {th: [] for th in thresholds}
 
         window_size = self.config["inference_args"]["window_size"]
-        time_resolution = self.config["data"]["train"]["dataset"][
-            "args"]["time_resolution"]
+        time_resolution = self.config["data"]["train"]["dataset"]["args"][
+            "time_resolution"]
         n_connect = math.ceil(0.5 / time_resolution)
 
         self.model.eval()
         with torch.no_grad():
-            for batch in tqdm(dataloader, unit="batch",
-                              ascii=True, ncols=100, leave=False):
+            for batch in tqdm(
+                dataloader, unit="batch", ascii=True, ncols=100, leave=False
+            ):
                 output = self.forward(batch, training=False)
                 for th in thresholds:
                     filtered_probs = eval_util.median_filter(
@@ -291,8 +248,7 @@ class Runner(object):
                             continue
                         change_indices = eval_util.find_contiguous_regions(
                             eval_util.connect_clusters(
-                                filtered_probs[idx],
-                                n_connect
+                                filtered_probs[idx], n_connect
                             )
                         )
                         for row in change_indices:
@@ -314,13 +270,11 @@ class Runner(object):
                     "offset": []
                 })
             pred_df = eval_util.predictions_to_time(
-                pred_df, ratio=time_resolution)
+                pred_df, ratio=time_resolution
+            )
             pred_buffer[th] = pred_df
 
-        output = {
-            "pred_buffer": pred_buffer,
-            "ground_truth": ground_truth
-        }
+        output = {"pred_buffer": pred_buffer, "ground_truth": ground_truth}
 
         if return_score:
             th_auc = eval_util.compute_th_auc(
@@ -330,7 +284,7 @@ class Runner(object):
                 gtc_threshold=0.5,
             )
             output["th_auc"] = th_auc
-        
+
         return output
 
     def eval_sed_scores(self, dataloader):
@@ -346,15 +300,11 @@ class Runner(object):
                 for onset, offset in phrase_item["segments"]:
                     if onset == 0 and offset == 0:
                         continue
-                    ground_truth[fname].append((
-                        onset,
-                        offset,
-                        "fake_event"
-                    ))
+                    ground_truth[fname].append((onset, offset, "fake_event"))
 
         event_classes = ["fake_event"]
-        time_resolution = self.config["data"]["train"]["dataset"][
-            "args"]["time_resolution"]
+        time_resolution = self.config["data"]["train"]["dataset"]["args"][
+            "time_resolution"]
         scores = {}
         self.model.eval()
         with torch.no_grad():
@@ -366,21 +316,31 @@ class Runner(object):
                     fname = f"{audiocap_id}_{start_index}"
                     if fname not in ground_truth.keys():
                         continue
-                    scores_arr = output["frame_sim"][idx].unsqueeze(-1).cpu().numpy()
+                    scores_arr = output["frame_sim"][idx].unsqueeze(-1).cpu(
+                    ).numpy()
                     timestamps = np.arange(output["frame_sim"].shape[1] + 1) * \
                         time_resolution
-                    scores[fname] = sed_scores_eval.utils.create_score_dataframe(
-                        scores_arr, timestamps=timestamps,
-                        event_classes=event_classes)
+                    scores[fname
+                          ] = sed_scores_eval.utils.create_score_dataframe(
+                              scores_arr,
+                              timestamps=timestamps,
+                              event_classes=event_classes
+                          )
 
-        return {
-            "ground_truth": ground_truth,
-            "scores": scores
-        }
-
+        return {"ground_truth": ground_truth, "scores": scores}
 
     def save_checkpoint(self, ckpt_path):
-        model_dict = self.model.state_dict()
+        param_names_to_save = []
+        for param_name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param_names_to_save.append(param_name)
+        for buffer_name, buffer in self.model.named_buffers():
+            param_names_to_save.append(buffer_name)
+        model_dict = {
+            name: param
+            for name, param in self.model.state_dict().items()
+            if name in param_names_to_save
+        }
         ckpt = {
             "model": model_dict,
             "epoch": self.epoch,
@@ -392,13 +352,13 @@ class Runner(object):
             ckpt["lr_scheduler"] = self.lr_scheduler.state_dict()
         torch.save(ckpt, ckpt_path)
 
-
     def resume_checkpoint(self, finetune=False, print_fn=print, training=True):
         ckpt = torch.load(self.config["resume"], "cpu")
-        load_args = {"training": training}
-        if "resume_args" in self.config:
-            load_args.update(self.config["resume_args"])
-        train_util.load_pretrained_model(self.model, ckpt, print_fn, **load_args)
+        train_util.load_pretrained_base(
+            model=self.model,
+            ckpt_or_state_dict=ckpt["model"],
+            output_fn=print_fn,
+        )
         if not finetune:
             self.epoch = ckpt["statistics"]["epoch"]
             self.metric_improver.load_state_dict(ckpt["metric_monitor"])
@@ -410,7 +370,6 @@ class Runner(object):
                             state[k] = v.to(self.device)
             self.optimizer.load_state_dict(ckpt["optimizer"])
             self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
-        
 
     def train(self, config, **kwargs):
         self.config = train_util.parse_config_or_kwargs(config, **kwargs)
@@ -446,34 +405,48 @@ class Runner(object):
         num_params = train_util.count_parameters(self.model)
         self.logger.info(f"{num_params} parameters in total")
 
-        self.optimizer = train_util.init_obj_from_str(
+        self.optimizer = hydra.utils.instantiate(
             self.config["optimizer"],
-            params=self.model.parameters())
-        train_util.pprint_dict(self.optimizer, self.logger.info, format="pretty")
+            params=self.model.parameters(),
+            _convert_="all"
+        )
+        train_util.pprint_dict(
+            self.optimizer, self.logger.info, format="pretty"
+        )
 
-        self.loss_fn = train_util.init_obj_from_str(self.config["loss"])
-
-        self.lr_scheduler = train_util.init_obj_from_str(
-            self.config["lr_scheduler"],
-            optimizer=self.optimizer)
+        self.loss_fn = hydra.utils.instantiate(
+            self.config["loss"], _convert_="all"
+        )
 
         self.__dict__.update(self.config["trainer"])
-
-        self.metric_improver = train_util.MetricImprover(
-            self.metric_monitor["mode"])
-
-        if "resume" in self.config:
-            assert "finetune" in self.__dict__, "finetune not being set"
-            self.resume_checkpoint(finetune=self.finetune,
-                                   print_fn=self.logger.info)
-
         self.epoch = 1
         self.iteration = 1
         self.not_improve_cnt = 0
         self.train_iter = iter(self.train_loader)
-        
         if not hasattr(self, "epoch_length"):
             self.epoch_length = len(self.train_loader)
+
+        self.total_steps = self.epochs * self.epoch_length
+
+        lr_scheduler_params = {"optimizer": self.optimizer}
+        if self.config["lr_scheduler"][
+            "_target_"] == "transformers.get_cosine_schedule_with_warmup":
+            lr_scheduler_params["num_training_steps"] = self.total_steps
+        self.lr_scheduler = hydra.utils.instantiate(
+            self.config["lr_scheduler"],
+            _convert_="all",
+            **lr_scheduler_params
+        )
+
+        self.metric_improver = train_util.MetricImprover(
+            self.metric_monitor["mode"]
+        )
+
+        if "resume" in self.config:
+            assert "finetune" in self.__dict__, "finetune not being set"
+            self.resume_checkpoint(
+                finetune=self.finetune, print_fn=self.logger.info
+            )
 
         for _ in range(self.epochs):
             train_output = self.train_epoch()
@@ -489,8 +462,8 @@ class Runner(object):
 
             lr = self.optimizer.param_groups[0]["lr"]
             train_loss = train_output["loss"]
-            output_str = f"epoch: {self.epoch}  train_loss: {train_loss:.2g}" \
-                         f"  val_loss: {val_result['loss']:.2g}" \
+            output_str = f"epoch: {self.epoch}  train_loss: {train_loss:.3g}" \
+                         f"  val_loss: {val_result['loss']:.3g}" \
                          f"  lr: {lr:.2g}"
             self.logger.info(output_str)
 
@@ -505,17 +478,16 @@ class Runner(object):
 
             if self.not_improve_cnt == self.early_stop:
                 break
-            
+
             self.epoch += 1
 
         self.save_checkpoint(exp_dir / "last.pth")
 
         return exp_dir
 
-    
     def eval_inference(self, dataloader):
         import sed_scores_eval
-        
+
         gt_list = []
         gt_dict = {}
         fname_to_aid = {}
@@ -537,17 +509,12 @@ class Runner(object):
                         "offset": offset,
                         "audio_id": audio_id,
                     })
-                    gt_dict[fname].append((
-                        onset,
-                        offset,
-                        "fake_event"
-                    ))
+                    gt_dict[fname].append((onset, offset, "fake_event"))
         gt_df = pd.DataFrame(gt_list)
 
         event_classes = ["fake_event"]
         n_thresholds = self.config["eval_config"]["n_thresholds"]
-        thresholds = np.arange(
-            1 / (n_thresholds * 2), 1, 1 / n_thresholds)
+        thresholds = np.arange(1 / (n_thresholds * 2), 1, 1 / n_thresholds)
         window_size = self.config["inference_args"]["window_size"]
         time_resolution = self.config["inference_args"]["time_resolution"]
         n_connect = math.ceil(0.5 / time_resolution)
@@ -557,8 +524,9 @@ class Runner(object):
 
         self.model.eval()
         with torch.no_grad():
-            for batch in tqdm(dataloader, unit="batch",
-                              ascii=True, ncols=100, leave=False):
+            for batch in tqdm(
+                dataloader, unit="batch", ascii=True, ncols=100, leave=False
+            ):
                 output = self.forward(batch, training=False)
                 for idx in range(len(batch["audiocap_id"])):
                     audiocap_id = batch["audiocap_id"][idx]
@@ -573,9 +541,12 @@ class Runner(object):
                     scores_arr = prob.unsqueeze(-1).cpu().numpy()
                     timestamps = np.arange(prob.shape[0] + 1) * \
                         time_resolution
-                    score_buffer[fname] = sed_scores_eval.utils.create_score_dataframe(
-                        scores_arr, timestamps=timestamps,
-                        event_classes=event_classes)
+                    score_buffer[
+                        fname] = sed_scores_eval.utils.create_score_dataframe(
+                            scores_arr,
+                            timestamps=timestamps,
+                            event_classes=event_classes
+                        )
                     for th in thresholds:
                         filtered_prob = eval_util.median_filter(
                             prob.unsqueeze(0).cpu(),
@@ -584,8 +555,7 @@ class Runner(object):
                         )[0]
                         change_indices = eval_util.find_contiguous_regions(
                             eval_util.connect_clusters(
-                                filtered_prob,
-                                n_connect
+                                filtered_prob, n_connect
                             )
                         )
                         for row in change_indices:
@@ -607,7 +577,8 @@ class Runner(object):
                     "offset": []
                 })
             pred_df = eval_util.predictions_to_time(
-                pred_df, ratio=time_resolution)
+                pred_df, ratio=time_resolution
+            )
             pred_buffer[th] = pred_df
 
         output = {
@@ -617,34 +588,23 @@ class Runner(object):
             "gt_dict": gt_dict,
             "fname_to_aid": fname_to_aid
         }
-        
-        return output
 
+        return output
 
     def evaluate(self, experiment_path, eval_config):
         eval_config = train_util.parse_config_or_kwargs(eval_config)
 
         exp_dir = Path(experiment_path)
-        self.config = train_util.parse_config_or_kwargs(exp_dir / "config.yaml" )
+        self.config = train_util.parse_config_or_kwargs(
+            exp_dir / "config.yaml"
+        )
         self.config["resume"] = exp_dir / eval_config["resume"]
         self.model = self.get_model(print)
         self.resume_checkpoint(finetune=True)
-        
-
-        key_copy_from_train = ["vocabulary"]
-        train_util.copy_args_recursive(self.config["data"]["train"],
-                                       eval_config["data"]["test"],
-                                       key_copy_from_train)
-
-        dataset = train_util.init_obj_from_str(
-            eval_config["data"]["test"]["dataset"])
-        collate_fn = train_util.init_obj_from_str(
-            eval_config["data"]["test"]["collate_fn"])
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            shuffle=False,
-            collate_fn=collate_fn,
-            batch_size=1)
+        dataloader = hydra.utils.instantiate(
+            eval_config["test_dataloader"],
+            _convert_="all",
+        )
 
         self.model = self.model.to(self.device)
 
@@ -652,8 +612,10 @@ class Runner(object):
             self.config["eval_config"] = {}
         if "inference_args" not in self.config:
             self.config["inference_args"] = {}
-        self.config["eval_config"]["n_thresholds"] = eval_config["n_thresholds"]
-        self.config["inference_args"]["window_size"] = eval_config["window_size"]
+        self.config["eval_config"]["n_thresholds"] = eval_config["n_thresholds"
+                                                                ]
+        self.config["inference_args"]["window_size"] = eval_config[
+            "window_size"]
         self.config["inference_args"]["time_resolution"] = eval_config[
             "time_resolution"]
 
@@ -679,18 +641,18 @@ class Runner(object):
 
         for max_efpr in eval_config["max_efprs"]:
             # psds = eval_util.compute_psds(
-                # pred_buffer,
-                # output["gt_df"],
-                # eval_config["data"]["test"]["duration"],
-                # dtc_threshold=0.5,
-                # gtc_threshold=0.5,
-                # save_dir=exp_dir / psds_dir,
-                # max_efpr=max_efpr
+            # pred_buffer,
+            # output["gt_df"],
+            # eval_config["data"]["test"]["duration"],
+            # dtc_threshold=0.5,
+            # gtc_threshold=0.5,
+            # save_dir=exp_dir / psds_dir,
+            # max_efpr=max_efpr
             # )
             psds = eval_util.compute_psds_sed_scores(
                 scores=output["score_buffer"],
                 ground_truth=output["gt_dict"],
-                duration=eval_config["data"]["test"]["duration"],
+                duration=eval_config["test_data_duration"],
                 fname_to_aid=output["fname_to_aid"],
                 dtc_threshold=0.5,
                 gtc_threshold=0.5,
@@ -711,35 +673,33 @@ class Runner(object):
                 max_threshold=max_th,
                 save_dir=exp_dir / th_auc_dir
             )
-            print(f"threshold: {min_th:.2f} ~ {max_th:.2f}, th_auc: {th_auc:.1%}")
-            print(f"threshold: {min_th:.2f} ~ {max_th:.2f}, th_auc: {th_auc:.1%}",
-                  file=writer)
+            print(
+                f"threshold: {min_th:.2f} ~ {max_th:.2f}, th_auc: {th_auc:.1%}"
+            )
+            print(
+                f"threshold: {min_th:.2f} ~ {max_th:.2f}, th_auc: {th_auc:.1%}",
+                file=writer
+            )
 
         writer.close()
 
-
-    def train_evaluate(self,
-                       train_config,
-                       eval_config,
-                       **kwargs):
+    def train_evaluate(self, train_config, eval_config, **kwargs):
         experiment_path = self.train(train_config, **kwargs)
         self.evaluate(experiment_path, eval_config)
         return experiment_path
-
 
     def debug(self, config, **kwargs):
         self.config = train_util.parse_config_or_kwargs(config, **kwargs)
         train_loader = self.get_train_dataloader()
         self.model = self.get_model(print).to(self.device)
         loss_fn = train_util.init_obj_from_str(self.config["loss"])
-        
+
         train_iter = iter(train_loader)
         for _ in trange(10):
             batch = next(train_iter)
             output = self.forward(batch, training=True)
             loss = loss_fn(output)
             loss.backward()
-
 
     def calc_params_macs(self, config, **kwargs):
         from thop import profile, clever_format
@@ -756,7 +716,6 @@ class Runner(object):
         macs, params = profile(self.model, inputs=(input_dict, ))
         macs, params = clever_format([macs, params], "%.3f")
         print(macs, params)
-        
 
 
 if __name__ == "__main__":

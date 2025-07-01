@@ -8,28 +8,23 @@ import torch
 from tqdm import trange
 from transformers import AutoTokenizer
 
-sys.path.insert(1, os.getcwd())
 import audio_text_retrieval_models.audio_encoder as audio_encoder_arch
 import audio_text_retrieval_models.text_encoder as text_encoder_arch
 import audio_text_retrieval_models.audio_text_model as module_arch
 
-tokenizer_cache = {
-    "prajjwal1/bert-medium": "/mnt/lustre/sjtu/home/xnx98/work/AudioTextPretrain/bert_cache/bert_medium_tokenizer",
-    "bert-base-uncased": "/mnt/lustre/sjtu/home/xnx98/work/AudioTextPretrain/bert_cache/bert_base_uncased_tokenizer"
-}
-
 
 def get_model(config):
     audio_encoder = getattr(
-        audio_encoder_arch, config["audio_encoder"]["type"])(
-        **config["audio_encoder"]["args"])
-    text_encoder = getattr(
-        text_encoder_arch, config["text_encoder"]["type"])(
-        **config["text_encoder"]["args"])
+        audio_encoder_arch, config["audio_encoder"]["type"]
+    )(**config["audio_encoder"]["args"])
+    text_encoder = getattr(text_encoder_arch, config["text_encoder"]["type"])(
+        **config["text_encoder"]["args"]
+    )
     model = getattr(module_arch, config["type"])(
         audio_encoder=audio_encoder,
         text_encoder=text_encoder,
-        **config["args"])
+        **config["args"]
+    )
     return model
 
 
@@ -37,33 +32,31 @@ def load_text_encoder(experiment_path, device):
     experiment_path = Path(experiment_path)
     config = json.load(open(experiment_path / "models" / "config.json"))
     model = get_model(config["model"])
-    checkpoint = torch.load(experiment_path / "models" / "trained_model.pth",
-                            "cpu")
+    checkpoint = torch.load(
+        experiment_path / "models" / "trained_model.pth", "cpu"
+    )
     model.load_state_dict(checkpoint["state_dict"])
     model = model.to(device)
     model.eval()
 
-    tokenizer_type = config["data_loader"]["collate_fn"]["args"]["tokenizer_type"]
-    try:
-        text_tokenizer = AutoTokenizer.from_pretrained(tokenizer_type)
-    except:
-        text_tokenizer = AutoTokenizer.from_pretrained(tokenizer_cache[tokenizer_type])
-    return {
-        "tokenizer": text_tokenizer,
-        "model": model,
-        "config": config
-    }
+    tokenizer_type = config["data_loader"]["collate_fn"]["args"][
+        "tokenizer_type"]
+
+    text_tokenizer = AutoTokenizer.from_pretrained(tokenizer_type)
+
+    return {"tokenizer": text_tokenizer, "model": model, "config": config}
 
 
 class Executor(object):
-
-    def phrase(self,
-               experiment_path,
-               phrase_input,
-               output,
-               debug=False,
-               batch_size=128,
-               with_proj=False):
+    def phrase(
+        self,
+        experiment_path,
+        phrase_input,
+        output,
+        debug=False,
+        batch_size=128,
+        with_proj=False
+    ):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = load_text_encoder(experiment_path, device)
@@ -76,7 +69,10 @@ class Executor(object):
 
         for idx, audio_item in enumerate(data):
             for phrase_item in audio_item["phrases"]:
-                phrase = phrase_item["phrase"]
+                if isinstance(phrase_item, dict):
+                    phrase = phrase_item["phrase"]
+                elif isinstance(phrase_item, str):
+                    phrase = phrase_item
                 phrases.append(phrase)
             if debug:
                 if idx >= 50:
@@ -87,11 +83,17 @@ class Executor(object):
         phrase_to_emb = {}
 
         for i in trange(0, len(phrases), batch_size):
-            texts = phrases[i: i + batch_size]
-            tokens = dict(tokenizer(texts, padding="max_length",
-                max_length=config["data_loader"]["collate_fn"][
-                    "args"]["max_text_length"],
-                truncation=True, return_tensors="pt"))
+            texts = phrases[i:i + batch_size]
+            tokens = dict(
+                tokenizer(
+                    texts,
+                    padding="max_length",
+                    max_length=config["data_loader"]["collate_fn"]["args"]
+                    ["max_text_length"],
+                    truncation=True,
+                    return_tensors="pt"
+                )
+            )
             for k, v in tokens.items():
                 tokens[k] = v.to(device)
             with torch.no_grad():
@@ -107,13 +109,15 @@ class Executor(object):
 
         pickle.dump(phrase_to_emb, open(output, "wb"))
 
-    def add_phrase(self,
-                   experiment_path,
-                   extra_phrase,
-                   phrase_emb,
-                   output,
-                   batch_size=128,
-                   with_proj=False):
+    def add_phrase(
+        self,
+        experiment_path,
+        extra_phrase,
+        phrase_emb,
+        output,
+        batch_size=128,
+        with_proj=False
+    ):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = load_text_encoder(experiment_path, device)
@@ -130,11 +134,17 @@ class Executor(object):
         phrase_to_emb = pickle.load(open(phrase_emb, "rb"))
 
         for i in trange(0, len(phrases), batch_size):
-            texts = phrases[i: i + batch_size]
-            tokens = dict(tokenizer(texts, padding="max_length",
-                max_length=config["data_loader"]["collate_fn"][
-                    "args"]["max_text_length"],
-                truncation=True, return_tensors="pt"))
+            texts = phrases[i:i + batch_size]
+            tokens = dict(
+                tokenizer(
+                    texts,
+                    padding="max_length",
+                    max_length=config["data_loader"]["collate_fn"]["args"]
+                    ["max_text_length"],
+                    truncation=True,
+                    return_tensors="pt"
+                )
+            )
             for k, v in tokens.items():
                 tokens[k] = v.to(device)
             with torch.no_grad():
@@ -150,12 +160,14 @@ class Executor(object):
 
         pickle.dump(phrase_to_emb, open(output, "wb"))
 
-    def label(self,
-              experiment_path,
-              label_encoder_input,
-              output,
-              batch_size=128,
-              with_proj=False):
+    def label(
+        self,
+        experiment_path,
+        label_encoder_input,
+        output,
+        batch_size=128,
+        with_proj=False
+    ):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = load_text_encoder(experiment_path, device)
         model = ckpt["model"]
@@ -168,11 +180,17 @@ class Executor(object):
         label_to_emb = {}
 
         for i in trange(0, len(labels), batch_size):
-            texts = labels[i: i + batch_size]
-            tokens = dict(tokenizer(texts, padding="max_length",
-                max_length=config["data_loader"]["collate_fn"][
-                    "args"]["max_text_length"],
-                truncation=True, return_tensors="pt"))
+            texts = labels[i:i + batch_size]
+            tokens = dict(
+                tokenizer(
+                    texts,
+                    padding="max_length",
+                    max_length=config["data_loader"]["collate_fn"]["args"]
+                    ["max_text_length"],
+                    truncation=True,
+                    return_tensors="pt"
+                )
+            )
             for k, v in tokens.items():
                 tokens[k] = v.to(device)
             with torch.no_grad():
