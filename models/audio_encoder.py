@@ -1,4 +1,6 @@
 from typing import Dict
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +8,7 @@ from torchaudio import transforms
 from torchlibrosa import SpecAugmentation
 
 from utils.train_util import do_mixup
+from models.base import LoadPretrainedMixin
 from models.utils import init_weights
 from models.panns import ConvBlock, init_layer, init_bn
 
@@ -13,17 +16,13 @@ from models.panns import ConvBlock, init_layer, init_bn
 def cdur_block(cin, cout, kernel_size=3, padding=1):
     return nn.Sequential(
         nn.BatchNorm2d(cin),
-        nn.Conv2d(cin,
-                  cout,
-                  kernel_size=kernel_size,
-                  padding=padding,
-                  bias=False),
-        nn.LeakyReLU(inplace=True, negative_slope=0.1)
+        nn.Conv2d(
+            cin, cout, kernel_size=kernel_size, padding=padding, bias=False
+        ), nn.LeakyReLU(inplace=True, negative_slope=0.1)
     )
 
 
 class CrnnEncoder(nn.Module):
-    
     def __init__(self, sample_rate, embed_dim):
         super().__init__()
         self.downsample_ratio = 4
@@ -49,16 +48,19 @@ class CrnnEncoder(nn.Module):
             nn.Dropout(0.3),
         )
         with torch.no_grad():
-            dummy_input = self.db_transform(self.melspec_extractor(
-                torch.randn(1, 16000)))
+            dummy_input = self.db_transform(
+                self.melspec_extractor(torch.randn(1, 16000))
+            )
             dummy_input = dummy_input.transpose(1, 2).unsqueeze(1)
             rnn_input_dim = self.cnn(dummy_input).shape
             rnn_input_dim = rnn_input_dim[1] * rnn_input_dim[-1]
 
-        self.gru = nn.GRU(rnn_input_dim,
-                          embed_dim // 2,
-                          bidirectional=True,
-                          batch_first=True)
+        self.gru = nn.GRU(
+            rnn_input_dim,
+            embed_dim // 2,
+            bidirectional=True,
+            batch_first=True
+        )
         self.apply(init_weights)
 
     def forward(self, input_dict: Dict):
@@ -75,22 +77,28 @@ class CrnnEncoder(nn.Module):
         length = torch.div(
             torch.as_tensor(input_dict["waveform_len"]),
             self.hop_length,
-            rounding_mode="floor") + 1
-        length = torch.div(length, self.downsample_ratio, rounding_mode="floor")
+            rounding_mode="floor"
+        ) + 1
+        length = torch.div(
+            length, self.downsample_ratio, rounding_mode="floor"
+        )
 
-        return {
-            "embedding": x,
-            "length": length
-        }
+        return {"embedding": x, "length": length}
 
 
-class Cnn8_Rnn(nn.Module):
+class Cnn8Rnn(nn.Module, LoadPretrainedMixin):
+    def __init__(
+        self,
+        sample_rate: int,
+        freeze_cnn: bool = False,
+        freeze_bn: bool = False,
+        pretrained: 'str | None' = None,
+        output_fn: callable = sys.stdout.write,
+    ):
 
-    def __init__(self, sample_rate, freeze_cnn=False, freeze_bn=False):
-        
-        super(Cnn8_Rnn, self).__init__()
+        super().__init__()
 
-        self.downsample_ratio = 4     # Downsampled ratio
+        self.downsample_ratio = 4  # Downsampled ratio
         self.time_resolution = 0.04
         self.freeze_cnn = freeze_cnn
         self.freeze_bn = freeze_bn
@@ -116,8 +124,11 @@ class Cnn8_Rnn(nn.Module):
         self.db_transform = transforms.AmplitudeToDB()
         # Spec augmenter
         self.spec_augmenter = SpecAugmentation(
-            time_drop_width=64, time_stripes_num=2,
-            freq_drop_width=8, freq_stripes_num=2)
+            time_drop_width=64,
+            time_stripes_num=2,
+            freq_drop_width=8,
+            freq_stripes_num=2
+        )
 
         self.bn0 = nn.BatchNorm2d(64)
 
@@ -129,8 +140,10 @@ class Cnn8_Rnn(nn.Module):
         self.fc1 = nn.Linear(512, 512, bias=True)
         self.rnn = nn.GRU(512, 256, bidirectional=True, batch_first=True)
         self.embed_dim = 512
-        
+
         self.init_weight()
+        if pretrained is not None:
+            self.load_pretrained(pretrained, output_fn)
 
         if self.freeze_cnn:
             for param in self.parameters():
@@ -138,27 +151,37 @@ class Cnn8_Rnn(nn.Module):
             for param in self.rnn.parameters():
                 param.requires_grad = True
 
+    def process_state_dict(
+        self, model_dict, pretrained_dict, output_fn, model_name
+    ):
+        pretrained_dict = pretrained_dict["model"]
+        return super().process_state_dict(
+            model_dict, pretrained_dict, output_fn, model_name
+        )
+
     def train(self, mode):
         super().train(mode=mode)
         if self.freeze_bn:
+
             def bn_eval(module):
                 class_name = module.__class__.__name__
                 if class_name.find("BatchNorm") != -1:
                     module.eval()
+
             self.apply(bn_eval)
         return self
 
     def init_weight(self):
         init_bn(self.bn0)
         init_layer(self.fc1)
- 
+
     def forward(self, input_dict: Dict):
         """
         Input: (batch_size, n_samples)"""
 
         waveform = input_dict["waveform"]
         x = self.melspec_extractor(waveform)
-        x = self.db_transform(x)    # (batch_size, mel_bins, time_steps)
+        x = self.db_transform(x)  # (batch_size, mel_bins, time_steps)
         x = x.transpose(1, 2)
         x = x.unsqueeze(1)
 
@@ -183,28 +206,30 @@ class Cnn8_Rnn(nn.Module):
         x = self.conv_block3(x, pool_size=(1, 2), pool_type='avg+max')
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv_block4(x, pool_size=(1, 2), pool_type='avg+max')
-        x = F.dropout(x, p=0.2, training=self.training) # (batch_size, 256, time_steps / 4, mel_bins / 16)
+        x = F.dropout(
+            x, p=0.2, training=self.training
+        )  # (batch_size, 256, time_steps / 4, mel_bins / 16)
         x = torch.mean(x, dim=3)
-        
+
         x = x.transpose(1, 2)
         x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu_(self.fc1(x))
-        x, _  = self.rnn(x)
+        x, _ = self.rnn(x)
 
         length = torch.div(
             torch.as_tensor(input_dict["waveform_len"]),
             self.hop_length,
-            rounding_mode="floor") + 1
+            rounding_mode="floor"
+        ) + 1
 
-        length = torch.div(length, self.downsample_ratio, rounding_mode="floor")
+        length = torch.div(
+            length, self.downsample_ratio, rounding_mode="floor"
+        )
 
         if self.training and mixup_lambda is not None:
             length = do_mixup(length, mixup_lambda)
-    
-        return {
-            "embedding": x,
-            "length": length
-        }
+
+        return {"embedding": x, "length": length}
 
 
 if __name__ == "__main__":
@@ -216,7 +241,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     audio_feats = audio_feats.to(device)
-    output = model({"audio_feat": audio_feats, "audio_feat_len": audio_feat_lens})
+    output = model({
+        "audio_feat": audio_feats,
+        "audio_feat_len": audio_feat_lens
+    })
     print("audio: ", output["audio"].shape, output["audio_len"].shape)
     if torch.cuda.is_available():
         from pytorch_memlab import MemReporter

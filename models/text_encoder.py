@@ -4,24 +4,29 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.init as init
+import torch.nn.functional as F
+from transformers import AutoModel, ClapModel, ClapProcessor
+from sentence_transformers import SentenceTransformer
 
 from models.utils import init_weights, mean_with_lens, generate_length_mask
 
 
 class EmbeddingLayer(nn.Module):
-
-    def __init__(self,
-                 vocab_size: int,
-                 embed_dim: int,
-                 pretrained_embedding: str = None,
-                 freeze_embedding: bool = False):
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim: int,
+        pretrained_embedding: str = None,
+        freeze_embedding: bool = False,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.core = nn.Embedding(vocab_size, embed_dim)
         self.apply(init_weights)
         if pretrained_embedding is not None:
-            self.load_pretrained_embedding(pretrained_embedding,
-                                           freeze_embedding)
+            self.load_pretrained_embedding(
+                pretrained_embedding, freeze_embedding
+            )
 
     def load_pretrained_embedding(self, weight: str, freeze: bool = True):
         weight = np.load(weight)
@@ -39,7 +44,6 @@ class EmbeddingLayer(nn.Module):
 
 
 class AttentionPooling(nn.Module):
-
     def __init__(self, emb_dim):
         super().__init__()
         self.fc = nn.Linear(emb_dim, 1)
@@ -55,16 +59,18 @@ class AttentionPooling(nn.Module):
 
 
 class EmbeddingAgg(nn.Module):
-
-    def __init__(self,
-                 vocab_size,
-                 embed_dim,
-                 pretrained_embedding: str = None,
-                 freeze_embedding: bool = False,
-                 aggregation: str = "mean"):
+    def __init__(
+        self,
+        vocab_size,
+        embed_dim,
+        pretrained_embedding: str = None,
+        freeze_embedding: bool = False,
+        aggregation: str = "mean"
+    ):
         super().__init__()
-        self.embedding = EmbeddingLayer(vocab_size, embed_dim,
-                                        pretrained_embedding, freeze_embedding)
+        self.embedding = EmbeddingLayer(
+            vocab_size, embed_dim, pretrained_embedding, freeze_embedding
+        )
         self.embed_dim = self.embedding.embed_dim
         self.agg = aggregation
         if aggregation == "attention":
@@ -83,26 +89,28 @@ class EmbeddingAgg(nn.Module):
 
 
 class RnnEncoder(nn.Module):
-
-    def __init__(self,
-                 vocab_size,
-                 embed_dim,
-                 hidden_dim,
-                 num_layers,
-                 dropout,
-                 bidirectional,
-                 rnn_type,
-                 pooling="mean"):
+    def __init__(
+        self,
+        vocab_size,
+        embed_dim,
+        hidden_dim,
+        num_layers,
+        dropout,
+        bidirectional,
+        rnn_type,
+        pooling="mean"
+    ):
         super().__init__()
         self.embedding = EmbeddingLayer(vocab_size, embed_dim)
         assert rnn_type in ("RNN", "GRU", "LSTM")
-        self.rnn = getattr(nn.modules.rnn,
-                           rnn_type)(input_size=embed_dim,
-                                     hidden_size=hidden_dim,
-                                     num_layers=num_layers,
-                                     batch_first=True,
-                                     dropout=dropout,
-                                     bidirectional=bidirectional)
+        self.rnn = getattr(nn.modules.rnn, rnn_type)(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout,
+            bidirectional=bidirectional
+        )
         self.embed_dim = hidden_dim * (bidirectional + 1)
         self.pooling = pooling
 
@@ -118,14 +126,14 @@ class RnnEncoder(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-
     def __init__(self, d_model, dropout, max_len=100):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1)
         div_term = torch.exp(
-            torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
+            torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
@@ -137,7 +145,6 @@ class PositionalEncoding(nn.Module):
 
 
 class ConvGRUCell(nn.Module):
-
     def __init__(self, input_size, hidden_size, kernel_size=1):
         super(ConvGRUCell, self).__init__()
         self.input_size = input_size
@@ -174,18 +181,20 @@ class ConvGRUCell(nn.Module):
         update = torch.sigmoid(self.update_gate(stacked_inputs))
         reset = torch.sigmoid(self.reset_gate(stacked_inputs))
         out_inputs = torch.tanh(
-            self.out_gate(torch.cat([input_, prev_state * reset], dim=2)))
+            self.out_gate(torch.cat([input_, prev_state * reset], dim=2))
+        )
         new_state = prev_state * (1 - update) + out_inputs * update
 
         return new_state
 
 
 class IntraAttention(nn.Module):
-
-    def __init__(self,
-                 embedding: nn.Module,
-                 num_layers: int,
-                 pooling: str = "mean") -> None:
+    def __init__(
+        self,
+        embedding: nn.Module,
+        num_layers: int,
+        pooling: str = "mean"
+    ) -> None:
         super().__init__()
         self.embedding = embedding
         self.embed_dim = embedding.embed_dim
@@ -202,14 +211,18 @@ class IntraAttention(nn.Module):
         batch_size, max_len, emb_dim = x.size()
 
         for _ in range(self.num_layers):
-            score = torch.bmm(self.pe(x),
-                              torch.transpose(self.pe(x), 1, 2).contiguous())
+            score = torch.bmm(
+                self.pe(x),
+                torch.transpose(self.pe(x), 1, 2).contiguous()
+            )
             len = torch.as_tensor(len)
-            mask1 = torch.arange(max_len).repeat(max_len * batch_size).view(
-                batch_size, max_len, max_len) < len.view(-1, 1, 1)
-            mask2 = torch.arange(max_len).repeat(max_len * batch_size).view(
-                batch_size, max_len,
-                max_len).transpose(1, 2) < len.view(-1, 1, 1)
+            mask1 = torch.arange(max_len).repeat(
+                max_len * batch_size
+            ).view(batch_size, max_len, max_len) < len.view(-1, 1, 1)
+            mask2 = torch.arange(max_len).repeat(
+                max_len * batch_size
+            ).view(batch_size, max_len,
+                   max_len).transpose(1, 2) < len.view(-1, 1, 1)
             mask = mask1 * mask2
             mask = mask.to(score.device)
             score = score.masked_fill(mask == 0, 1e-10)
@@ -225,23 +238,24 @@ class IntraAttention(nn.Module):
 
 
 class SelfAttention(nn.Module):
-
-    def __init__(self,
-                 vocab_size,
-                 embed_dim,
-                 num_heads,
-                 dropout=0.2,
-                 pretrained_embedding=None,
-                 freeze_embedding=False) -> None:
+    def __init__(
+        self,
+        vocab_size,
+        embed_dim,
+        num_heads,
+        dropout=0.2,
+        pretrained_embedding=None,
+        freeze_embedding=False
+    ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
-        self.embedding = EmbeddingLayer(vocab_size, embed_dim,
-                                        pretrained_embedding, freeze_embedding)
+        self.embedding = EmbeddingLayer(
+            vocab_size, embed_dim, pretrained_embedding, freeze_embedding
+        )
         self.pe = PositionalEncoding(embed_dim, dropout)
-        self.mha = nn.MultiheadAttention(embed_dim,
-                                         num_heads,
-                                         dropout,
-                                         batch_first=True)
+        self.mha = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout, batch_first=True
+        )
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
     def forward(self, input_dict):
@@ -255,11 +269,9 @@ class SelfAttention(nn.Module):
 
 
 class Bert(nn.Module):
-
-    def __init__(self, model_type):
+    def __init__(self, model_name: str):
         super().__init__()
-        from transformers import AutoModel
-        self.model = AutoModel.from_pretrained(model_type)
+        self.model = AutoModel.from_pretrained(model_name)
         self.dummy_param = nn.Parameter(torch.zeros(1))
         self.embed_dim = self.model.config.hidden_size
 
@@ -282,10 +294,8 @@ class Bert(nn.Module):
 
 
 class SentenceBert(nn.Module):
-
     def __init__(self, model_type):
         super().__init__()
-        from sentence_transformers import SentenceTransformer
         self.model = SentenceTransformer(model_type)
         self.dummy_param = nn.Parameter(torch.zeros(1))
         self.embed_dim = self.model[0].auto_model.config.hidden_size
@@ -296,3 +306,22 @@ class SentenceBert(nn.Module):
             tokens[k] = tokens[k].to(self.dummy_param.device)
         output = self.model(tokens)
         return {"seq_emb": output["sentence_embedding"], "token_emb": output}
+
+
+class LaionClapEncoder(nn.Module):
+    def __init__(self, model_type: str):
+        super().__init__()
+        self.tokenizer = ClapProcessor.from_pretrained(model_type)
+        model = ClapModel.from_pretrained(model_type)
+        self.model = model.text_model
+        self.projection = model.text_projection
+        self.embed_dim = model.text_projection.config.projection_dim
+
+    def forward(self, input_dict):
+        required_keys = ["input_ids", "attention_mask"]
+        tokens = {k: input_dict[k].long() for k in required_keys}
+        output = self.model(**tokens)
+        token_emb = self.projection(output.last_hidden_state)
+        seq_emb = self.projection(output.pooler_output)
+        seq_emb = F.normalize(seq_emb, dim=-1)
+        return {"seq_emb": seq_emb, "token_emb": token_emb}

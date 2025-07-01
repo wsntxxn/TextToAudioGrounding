@@ -12,7 +12,8 @@ from transformers import AutoModel
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = AutoModel.from_pretrained(
-    "wsntxxn/cnn8rnn-w2vmean-audiocaps-grounding",
+    "wsntxxn/cnn8rnn-laionclap-audiocapsv2-grounding", # a larger model trained on AudioCaps v2
+    # "wsntxxn/cnn8rnn-w2vmean-audiocaps-grounding", # a small model trained on AudioCaps v1
     trust_remote_code=True
 ).to(device)
 
@@ -77,10 +78,11 @@ for split in train val test; do
 done
 python utils/data/prepare_duration.py data/audiogrounding/test/wav.csv data/audiogrounding/test/duration.csv
 ```
-4. prepare vocabulary file:
+4. [Optional] prepare vocabulary file:
 ```bash
 python utils/build_vocab.py data/audiogrounding/train/label.json data/audiogrounding/train/vocab.pkl
 ```
+This step is for using the simple NLTK tokenizer and training text encoder from scratch. If you use pre-trained text encoder, you can skip this step.
 5. run the training and evaluation:
 ```bash
 python python_scripts/training/run_strong.py train_evaluate \
@@ -103,7 +105,10 @@ Example configuration files are provided [here](eg_configs/strongly_supervised/a
 
 ### Inference
 
-We provide the best-performing WSTAG model, downloaded [here](https://drive.google.com/file/d/1xDQT_KQ6l9Hzcn4QkO1G3XBJmdw1LCVe/view?usp=drive_link). Unzip it into `$MODEL_DIR`:
+Note: the model below is the same as "wsntxxn/cnn8rnn-w2vmean-audiocaps-grounding" on Hugging Face.
+We recommend using the newer "wsntxxn/cnn8rnn-laionclap-audiocapsv2-grounding" on Hugging Face.
+
+We provide the best-performing WSTAG model, download [here](https://drive.google.com/file/d/1xDQT_KQ6l9Hzcn4QkO1G3XBJmdw1LCVe/view?usp=drive_link). Unzip it into `$MODEL_DIR`:
 ```bash
 unzip audiocaps_cnn8rnn_w2vmean_dp_ls_clustering_selfsup.zip -d $MODEL_DIR
 ```

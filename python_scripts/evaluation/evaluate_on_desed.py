@@ -5,6 +5,7 @@ import pickle
 
 import numpy as np
 import pandas as pd
+import hydra
 import librosa
 import torchaudio
 import h5py
@@ -12,9 +13,9 @@ import torch
 from tqdm import tqdm
 import sed_scores_eval
 
-import sys
-sys.path.insert(1, os.getcwd())
 import utils.train_util as train_util
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def load_audio(audio_path, sample_rate):
@@ -32,21 +33,20 @@ def read_from_h5(key, key_to_h5, cache):
         cache[hdf5_path] = h5py.File(hdf5_path, "r")
     try:
         return cache[hdf5_path][key][()]
-    except KeyError: # audiocaps compatibility
+    except KeyError:  # audiocaps compatibility
         key = "Y" + key + ".wav"
         return cache[hdf5_path][key][()]
 
 
 class InferDataset(torch.utils.data.Dataset):
-
     def __init__(self, wav_df, sample_rate=32000):
         super().__init__()
         if "file_name" in wav_df.columns:
-            self.aid_to_fname = dict(zip(wav_df["audio_id"],
-                                         wav_df["file_name"]))
+            self.aid_to_fname = dict(
+                zip(wav_df["audio_id"], wav_df["file_name"])
+            )
         elif "hdf5_path" in wav_df.columns:
-            self.aid_to_h5 = dict(zip(wav_df["audio_id"],
-                                      wav_df["hdf5_path"]))
+            self.aid_to_h5 = dict(zip(wav_df["audio_id"], wav_df["hdf5_path"]))
             self.h5_cache = {}
         self.aids = wav_df["audio_id"].unique()
         self.sample_rate = sample_rate
@@ -57,7 +57,9 @@ class InferDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         audio_id = self.aids[index]
         if hasattr(self, "aid_to_fname"):
-            waveform = load_audio(self.aid_to_fname[audio_id], self.sample_rate)
+            waveform = load_audio(
+                self.aid_to_fname[audio_id], self.sample_rate
+            )
         elif hasattr(self, "aid_to_h5"):
             waveform = read_from_h5(audio_id, self.aid_to_h5, self.h5_cache)
         else:
@@ -65,38 +67,18 @@ class InferDataset(torch.utils.data.Dataset):
         return {"audio_id": audio_id, "waveform": waveform}
 
 
-def get_model(config, print_fn):
-
-    cfg = config["model"]
-
-    kwargs = {}
-
-    for k in cfg:
-        if k not in ["type", "args", "pretrained"]:
-            sub_model = train_util.init_obj_from_str(cfg[k])
-            if "pretrained" in cfg[k]:
-                train_util.load_pretrained_model(
-                    sub_model,
-                    cfg[k]["pretrained"],
-                    print_fn)
-            kwargs[k] = sub_model
-
-    model = train_util.init_obj_from_str(cfg, **kwargs)
-
-    return model
-
-
-def resume_checkpoint(model, config, print_fn=print, training=True):
+def resume_checkpoint(model, config, print_fn=print):
     ckpt = torch.load(config["resume"], "cpu")
-    load_args = {"training": training}
-    train_util.load_pretrained_model(model, ckpt, print_fn, **load_args)
+    train_util.load_pretrained_base(
+        model=model, ckpt_or_state_dict=ckpt["model"], output_fn=print_fn
+    )
 
 
-def compute_psds(scores,
-                 ground_truth,
-                 psds_cfg):
-    duration = pd.read_csv("/hpc_stor03/sjtu_home/xuenan.xu/workspace/sound_event_detection/desed/data/dcase2021/dataset/metadata/eval/public_durations.tsv",
-                           sep="\t")
+def compute_psds(scores, ground_truth, psds_cfg):
+    duration = pd.read_csv(
+        "/hpc_stor03/sjtu_home/xuenan.xu/workspace/sound_event_detection/desed/data/dcase2021/dataset/metadata/eval/public_durations.tsv",
+        sep="\t"
+    )
     audio_durations = dict(zip(duration["filename"], duration["duration"]))
     psds, _, single_class_rocs = (
         sed_scores_eval.intersection_based.psds(
@@ -115,39 +97,35 @@ def compute_psds(scores,
     return psds
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
 def load_model_data(args):
     exp_path = args.exp_path
     exp_dir = Path(exp_path)
     config = train_util.parse_config_or_kwargs(exp_dir / "config.yaml")
     config["resume"] = exp_dir / "best.pth"
-    model = get_model(config, print)
+    model = train_util.instantiate_model(config["model"], print)
     resume_checkpoint(model, config)
-    model = model.to(device)
+    model = model.to(DEVICE)
     model.eval()
-    
+
     wav_df = pd.read_csv(args.wav, sep="\t")
     dataset = InferDataset(wav_df)
     dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=1,
-        num_workers=4
+        dataset, batch_size=1, num_workers=4
     )
 
-    tokenizer = train_util.init_obj_from_str(config["data"]["train"][
-        "collate_fn"]["tokenizer"])
+    tokenizer = hydra.utils.instantiate(
+        config["data"]["train_dataloader"]["collate_fn"]["tokenizer"],
+        _convert_="all"
+    )
 
-    return model, dataloader, tokenizer 
+    return model, dataloader, tokenizer
 
 
-# classes = ["Speech", "Frying", "Dishes", "Running_water", "Blender",
-#             "Electric_shaver_toothbrush", "Alarm_bell_ringing", "Cat",
-#             "Dog", "Vacuum_cleaner"]
-
-classes = ["Speech", "Cat",
-           "Dog"]
+classes = [
+    "Speech", "Frying", "Dishes", "Running_water", "Blender",
+    "Electric_shaver_toothbrush", "Alarm_bell_ringing", "Cat", "Dog",
+    "Vacuum_cleaner"
+]
 
 class_to_phrase = {
     "Speech": "speaking",
@@ -165,15 +143,18 @@ class_to_phrase = {
 
 def evaluate_psds(args):
 
-    model, dataloader, tokenizer = load_model_data(args)    
+    model, dataloader, tokenizer = load_model_data(args)
     time_resolution = args.time_resolution
 
-    gt_df = pd.read_csv("/hpc_stor03/sjtu_home/xuenan.xu/workspace/sound_event_detection/desed/data/raw_datasets/desed_real/metadata/eval/public.tsv", sep="\t")
+    gt_df = pd.read_csv(
+        "/hpc_stor03/sjtu_home/xuenan.xu/workspace/sound_event_detection/desed/data/raw_datasets/desed_real/metadata/eval/public.tsv",
+        sep="\t"
+    )
     score_buffer = {}
     gt_dict = {}
     with torch.no_grad():
         for batch in tqdm(dataloader):
-            waveform = batch["waveform"].to(device).float()
+            waveform = batch["waveform"].to(DEVICE).float()
             audio_id = batch["audio_id"][0]
             sample_df = gt_df[gt_df["filename"] == audio_id]
             gt_dict[audio_id] = []
@@ -194,8 +175,11 @@ def evaluate_psds(args):
             for class_ in classes:
                 text = class_to_phrase[class_]
                 tokens = tokenizer([text])
-                tokens["text"] = tokens["text"].unsqueeze(1).long().to(device)
-                tokens["text_len"] = np.array(tokens["text_len"])[:, np.newaxis]
+                for k in model.text_forward_keys:
+                    tokens[k] = train_util.unsqueeze_at_1(tokens[k])
+                for k, v in tokens.items():
+                    if isinstance(v, torch.Tensor):
+                        tokens[k] = v.long().to(DEVICE)
                 input_dict.update(tokens)
                 output = model(input_dict)
                 prob = output["frame_sim"][0, :, 0]
@@ -205,9 +189,11 @@ def evaluate_psds(args):
             scores_arr = np.stack(scores_arr).transpose()
             timestamps = np.arange(scores_arr.shape[0] + 1) * \
                 time_resolution
-            score_buffer[audio_id] = sed_scores_eval.utils.create_score_dataframe(
-                scores_arr, timestamps=timestamps,
-                event_classes=classes)
+            score_buffer[audio_id] = (
+                sed_scores_eval.utils.create_score_dataframe(
+                    scores_arr, timestamps=timestamps, event_classes=classes
+                )
+            )
 
     psds1_cfg = {
         "dtc_threshold": 0.7,
@@ -222,7 +208,7 @@ def evaluate_psds(args):
         "cttc_threshold": 0.3,
         "alpha_ct": 0.5,
         "alpha_st": 1
-    }    
+    }
     psds1 = compute_psds(score_buffer, gt_dict, psds1_cfg)
     psds2 = compute_psds(score_buffer, gt_dict, psds2_cfg)
     print(f"psds1: {psds1:.4f}, psds2: {psds2:.4f}")
@@ -233,7 +219,7 @@ def evaluate_op_macro_f1(args):
     import utils.sed_utils as sed_utils
     from psds_eval import PSDSEval
 
-    model, dataloader, tokenizer = load_model_data(args)    
+    model, dataloader, tokenizer = load_model_data(args)
     time_resolution = args.time_resolution
 
     threshold = args.threshold
@@ -248,7 +234,7 @@ def evaluate_op_macro_f1(args):
 
     with torch.no_grad():
         for batch in tqdm(dataloader):
-            waveform = batch["waveform"].to(device).float()
+            waveform = batch["waveform"].to(DEVICE).float()
             audio_id = batch["audio_id"][0]
             input_dict = {
                 "specaug": False,
@@ -259,11 +245,13 @@ def evaluate_op_macro_f1(args):
             for class_ in classes:
                 text = class_to_phrase[class_]
                 tokens = tokenizer([text])
-                tokens["text"] = tokens["text"].unsqueeze(1)
-                tokens["text_len"] = np.array(tokens["text_len"])[:, np.newaxis]
+                # TODO this only works for MultiTextBiEncoder, maybe
+                # the unsqueeze operation should be done in the model
+                for k in model.text_forward_keys:
+                    tokens[k] = train_util.unsqueeze_at_1(tokens[k])
                 for k, v in tokens.items():
                     if isinstance(v, torch.Tensor):
-                        tokens[k] = v.long().to(device)
+                        tokens[k] = v.long().to(DEVICE)
                 input_dict.update(tokens)
                 output = model(input_dict)
                 prob = output["frame_sim"][0, :, 0]
@@ -271,10 +259,10 @@ def evaluate_op_macro_f1(args):
                 prob = prob.cpu().numpy()
                 probs.append(prob)
             probs = np.stack(probs).transpose()[np.newaxis, :, :]
-            thresholded_predictions = postprocessing_method(
-                probs, *threshold)
+            thresholded_predictions = postprocessing_method(probs, *threshold)
             labelled_predictions = sed_utils.decode_with_timestamps(
-                classes, thresholded_predictions)
+                classes, thresholded_predictions
+            )
 
             prediction = labelled_predictions[0]
             for event_label, onset, offset in prediction:
@@ -284,23 +272,37 @@ def evaluate_op_macro_f1(args):
                     "onset": onset,
                     "offset": offset
                 })
-            
-    output_df = pd.DataFrame(pred_list, columns=['filename', 'event_label',
-                                                 'onset', 'offset'])
+
+    output_df = pd.DataFrame(
+        pred_list, columns=['filename', 'event_label', 'onset', 'offset']
+    )
     output_df = sed_utils.predictions_to_time(output_df, time_resolution)
 
-    if not Path(args.output_pred).parent.exists():
-        Path(args.output_pred).parent.mkdir(parents=True)
-    output_df.to_csv(args.output_pred, sep="\t", index=False, float_format="%.3f")
+    output_pred = args.output_pred
+    exp_path = Path(args.exp_path)
+    if output_pred is None:
+        output_pred = exp_path / "pred_desed.csv"
+    if not Path(output_pred).parent.exists():
+        Path(output_pred).parent.mkdir(parents=True)
+    output_df.to_csv(output_pred, sep="\t", index=False, float_format="%.3f")
 
-    groundtruth = pd.read_csv("/hpc_stor03/sjtu_home/xuenan.xu/workspace/sound_event_detection/desed/data/raw_datasets/desed_real/metadata/eval/public.tsv", sep="\t")
-    metadata = pd.read_csv("/hpc_stor03/sjtu_home/xuenan.xu/workspace/sound_event_detection/desed/data/dcase2021/dataset/metadata/eval/public_durations.tsv", sep="\t")
+    groundtruth = pd.read_csv(
+        "/hpc_stor03/sjtu_home/xuenan.xu/workspace/sound_event_detection/desed/data/raw_datasets/desed_real/metadata/eval/public.tsv",
+        sep="\t"
+    )
+    metadata = pd.read_csv(
+        "/hpc_stor03/sjtu_home/xuenan.xu/workspace/sound_event_detection/desed/data/dcase2021/dataset/metadata/eval/public_durations.tsv",
+        sep="\t"
+    )
     psds_eval = PSDSEval(ground_truth=groundtruth, metadata=metadata)
     macro_f, class_f = psds_eval.compute_macro_f_score(output_df)
 
-    if not Path(args.output_score).parent.exists():
-        Path(args.output_score).parent.mkdir(parents=True)
-    with open(args.output_score, "w") as writer:
+    output_score = args.output_score
+    if output_score is None:
+        output_score = exp_path / "score_desed.txt"
+    if not Path(output_score).parent.exists():
+        Path(output_score).parent.mkdir(parents=True)
+    with open(output_score, "w") as writer:
         print(f"macro F-score: {macro_f*100:.2f}", file=writer)
         print(f"macro F-score: {macro_f*100:.2f}")
         for clsname, f in class_f.items():
@@ -308,21 +310,28 @@ def evaluate_op_macro_f1(args):
             print(f"  {clsname}: {f*100:.2f}")
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_path", type=str)
-    parser.add_argument("--wav", type=str)
+    parser.add_argument(
+        "--wav",
+        type=str,
+        default=
+        "/hpc_stor03/sjtu_home/xuenan.xu/workspace/sound_event_detection/audioset_event_detection/desed_data/wav.csv"
+    )
     parser.add_argument("--time_resolution", type=float, default=0.04)
-    parser.add_argument("--metric",
-                        choices=["psds", "op_macro_f1"],
-                        type=str,
-                        required=True)
-    parser.add_argument("--threshold", nargs="+", type=float, default=[0.75, 0.25])
+    parser.add_argument(
+        "--metric",
+        choices=["psds", "op_macro_f1"],
+        type=str,
+        default="op_macro_f1"
+    )
+    parser.add_argument(
+        "--threshold", nargs="+", type=float, default=[0.75, 0.25]
+    )
     parser.add_argument("--output_pred", type=str)
     parser.add_argument("--output_score", type=str)
     args = parser.parse_args()
-
 
     if args.metric == "psds":
         evaluate_psds(args)

@@ -9,21 +9,24 @@ from models.utils import generate_length_mask
 
 
 class FrameBceLoss(nn.Module):
-
     def forward(self, output: Dict):
-        frame_sim = output["frame_sim"] # [batch_size, max_len]
+        frame_sim = output["frame_sim"]  # [batch_size, max_len]
         if frame_sim.ndim == 3 and frame_sim.size(2) == 1:
             frame_sim = frame_sim.squeeze(2)
-        length = output["length"] # [N]
-        label = output["label"] # [N, T]
-        loss = F.binary_cross_entropy(frame_sim, label, reduction="none") # [N, T]
+        length = output["length"]  # [N]
+        label = output["label"]  # [N, T]
+        loss = F.binary_cross_entropy(
+            frame_sim, label, reduction="none"
+        )  # [N, T]
         mask = generate_length_mask(length).to(frame_sim.device)
         loss *= mask
         loss = loss.sum() / mask.sum()
         return loss
-    
+
     def forward_tensor(self, frame_sim, label, length):
-        loss = F.binary_cross_entropy(frame_sim, label, reduction="none") # [N, T]
+        loss = F.binary_cross_entropy(
+            frame_sim, label, reduction="none"
+        )  # [N, T]
         mask = generate_length_mask(length).to(frame_sim.device)
         if loss.ndim == 3:
             mask = mask.unsqueeze(-1).expand(*loss.size())
@@ -33,7 +36,6 @@ class FrameBceLoss(nn.Module):
 
 
 class ClipBceLoss(nn.Module):
-
     def forward(self, output: Dict):
         return F.binary_cross_entropy(output["clip_sim"], output["label"])
 
@@ -42,7 +44,6 @@ class ClipBceLoss(nn.Module):
 
 
 class MilNceLoss(nn.Module):
-
     def __init__(self, tau=1.0) -> None:
         super().__init__()
         self.tau = tau
@@ -56,7 +57,6 @@ class MilNceLoss(nn.Module):
 
 
 class FocalClipBceLoss(nn.Module):
-
     def __init__(self, gamma=2, alpha=0.25) -> None:
         super().__init__()
         self.gamma = gamma
@@ -73,7 +73,6 @@ class FocalClipBceLoss(nn.Module):
 
 
 class ClipBceLossFreqWeight(nn.Module):
-
     def __init__(self, C, gamma) -> None:
         super().__init__()
         self.C = C
@@ -82,14 +81,13 @@ class ClipBceLossFreqWeight(nn.Module):
     def forward(self, output: Dict):
         counts = output["counts"]
         label = output["label"]
-        weight = (self.C / (self.C + counts)) ** self.gamma
+        weight = (self.C / (self.C + counts))**self.gamma
         weight = torch.as_tensor(weight).to(output["clip_sim"].device)
         weight = torch.where(label == 0.0, 1.0, weight)
         return F.binary_cross_entropy(output["clip_sim"], label, weight=weight)
 
 
 class SymmetricClipBceLoss(nn.Module):
-
     def __init__(self, a=1, b=1, eps=1e-3) -> None:
         super().__init__()
         self.a = a
@@ -100,12 +98,13 @@ class SymmetricClipBceLoss(nn.Module):
         clip_sim = output["clip_sim"]
         label = output["label"]
         loss = F.binary_cross_entropy(clip_sim, label)
-        loss += F.binary_cross_entropy(label.clamp(self.eps, 1.0 - self.eps), clip_sim)
+        loss += F.binary_cross_entropy(
+            label.clamp(self.eps, 1.0 - self.eps), clip_sim
+        )
         return loss
 
 
 class OriginSymmetricClipBceLoss(nn.Module):
-
     def __init__(self, a=1, b=1, eps=1e-3) -> None:
         super().__init__()
         self.a = a
@@ -116,16 +115,17 @@ class OriginSymmetricClipBceLoss(nn.Module):
         clip_sim = output["clip_sim"]
         label = output["label"]
         loss = F.binary_cross_entropy(clip_sim, label)
-        reverse_loss = - (label * (1 - clip_sim) * self.A + (1 - label) * self.A * clip_sim).mean()
+        reverse_loss = -(
+            label * (1 - clip_sim) * self.A + (1 - label) * self.A * clip_sim
+        ).mean()
         tot_loss = self.a * loss + self.b * reverse_loss
         return tot_loss
 
 
 class PriorAdjustedClipBceLoss(nn.Module):
-
     def __init__(self, data_size, tau=1) -> None:
         super().__init__()
-        self.data_size = data_size # [n_classes, ]
+        self.data_size = data_size  # [n_classes, ]
         self.tau = tau
 
     def forward(self, output: Dict):
@@ -134,30 +134,34 @@ class PriorAdjustedClipBceLoss(nn.Module):
         counts = output["counts"]
         counts = torch.as_tensor(counts).to(clip_sim.device)
         prior = counts / self.data_size
-        adjusted_one_logit = clip_sim * ((prior) ** self.tau)
-        adjusted_zero_logit = (1 - clip_sim) * ((1 - prior) ** self.tau)
-        adjusted_clip_sim = adjusted_one_logit / (adjusted_one_logit + adjusted_zero_logit)
+        adjusted_one_logit = clip_sim * ((prior)**self.tau)
+        adjusted_zero_logit = (1 - clip_sim) * ((1 - prior)**self.tau)
+        adjusted_clip_sim = adjusted_one_logit / (
+            adjusted_one_logit + adjusted_zero_logit
+        )
         loss = F.binary_cross_entropy(adjusted_clip_sim, label)
         return loss
 
 
 class MaskedClipBceLoss(nn.Module):
-
     def forward(self, output: Dict):
 
-        loss = F.binary_cross_entropy(output["clip_sim"], output["label"], reduce="none")
+        loss = F.binary_cross_entropy(
+            output["clip_sim"], output["label"], reduce="none"
+        )
         cls_mask = output["label_mask"]
         loss *= cls_mask
         return loss.sum() / cls_mask.sum()
 
 
 class MaskedFrameBceLoss(nn.Module):
-
     def forward(self, output: Dict):
-        prob = output["frame_sim"] # [N, T, C]
-        length = output["length"] # [N]
-        label = output["strong_label"] # [N, T, C]
-        loss = F.binary_cross_entropy(prob, label, reduction="none") # [N, T, C]
+        prob = output["frame_sim"]  # [N, T, C]
+        length = output["length"]  # [N]
+        label = output["strong_label"]  # [N, T, C]
+        loss = F.binary_cross_entropy(
+            prob, label, reduction="none"
+        )  # [N, T, C]
         len_mask = generate_length_mask(length).to(prob.device)
         loss *= len_mask.unsqueeze(-1)
         cls_mask = output["strong_label_mask"]
@@ -167,13 +171,12 @@ class MaskedFrameBceLoss(nn.Module):
 
 
 class ClipMaskedFrameBceLoss(nn.Module):
-
     def __init__(self, frame_weight):
         super().__init__()
         self.clip_loss_fn = ClipBceLoss()
         self.frame_loss_fn = MaskedFrameBceLoss()
         self.frame_weight = frame_weight
-    
+
     def forward(self, output: Dict):
         return (1 - self.frame_weight) * self.clip_loss_fn.forward_tensor(
             output["clip_sim"], output["weak_label"]) + \
@@ -181,13 +184,14 @@ class ClipMaskedFrameBceLoss(nn.Module):
 
 
 class ClipFrameBceLoss(nn.Module):
-
-    def __init__(self,
-                 frame_weight,
-                 clip_label_key="weak_label",
-                 clip_prob_key="clip_sim",
-                 frame_label_key="strong_label",
-                 frame_prob_key="frame_sim"):
+    def __init__(
+        self,
+        frame_weight,
+        clip_label_key="weak_label",
+        clip_prob_key="clip_sim",
+        frame_label_key="strong_label",
+        frame_prob_key="frame_sim"
+    ):
         super().__init__()
         self.clip_loss_fn = ClipBceLoss()
         self.frame_loss_fn = FrameBceLoss()
@@ -196,7 +200,7 @@ class ClipFrameBceLoss(nn.Module):
         self.clip_prob_key = clip_prob_key
         self.frame_label_key = frame_label_key
         self.frame_prob_key = frame_prob_key
-    
+
     def forward(self, output: Dict):
         return (1 - self.frame_weight) * self.clip_loss_fn.forward_tensor(
             output[self.clip_prob_key], output[self.clip_label_key]) + \
@@ -207,7 +211,6 @@ class ClipFrameBceLoss(nn.Module):
 
 
 class VectorQuantizeLoss(nn.Module):
-
     def __init__(self, loss_fn, vq_weight=1.0):
         super().__init__()
         self.loss_fn = loss_fn
@@ -217,14 +220,10 @@ class VectorQuantizeLoss(nn.Module):
         return self.vq_weight * output["vq_loss"] + self.loss_fn(output)
 
     def get_separate_loss(self, output):
-        return {
-            "cls_loss": self.loss_fn(output),
-            "vq_loss": output["vq_loss"]
-        }
+        return {"cls_loss": self.loss_fn(output), "vq_loss": output["vq_loss"]}
 
 
-class MaxMarginRankingLoss(nn.Module): # triplet weighted
-
+class MaxMarginRankingLoss(nn.Module):  # triplet weighted
     def __init__(self, margin=1, fix_norm=True, lamda1=1, sim_key="sim"):
         super().__init__()
         self.fix_norm = fix_norm
@@ -254,7 +253,8 @@ class MaxMarginRankingLoss(nn.Module): # triplet weighted
             keep = torch.ones(x.shape) - torch.eye(x.shape[0])  # 128 x 128
             keep1 = keep.view(-1, 1)
             keep2 = keep.transpose(0, 1).contiguous().view(-1, 1)
-            keep_idx = torch.nonzero(torch.cat((keep1, keep2), 0).flatten()).flatten()
+            keep_idx = torch.nonzero(torch.cat((keep1, keep2),
+                                               0).flatten()).flatten()
             if x1.is_cuda:
                 keep_idx = keep_idx.cuda()
             x1_ = torch.index_select(x1, dim=0, index=keep_idx)
@@ -265,7 +265,6 @@ class MaxMarginRankingLoss(nn.Module): # triplet weighted
 
 
 class InfoNceLoss(nn.Module):
-
     def __init__(self, tau=0.07):
         super().__init__()
         self.loss_fn = nn.CrossEntropyLoss()
@@ -284,7 +283,6 @@ class InfoNceLoss(nn.Module):
 
 # triplet max
 class MaxTripletLoss(nn.Module):
-
     def __init__(self, margin=1.0):
         super().__init__()
         self.margin = margin
@@ -319,7 +317,6 @@ class MaxTripletLoss(nn.Module):
 
 # triplet random
 class RandomTripletLoss(nn.Module):
-
     def __init__(self, margin=1.0):
         super().__init__()
         self.margin = margin
@@ -356,7 +353,6 @@ class RandomTripletLoss(nn.Module):
 
 # weighted triplet
 class WeightedTripletLoss(nn.Module):
-
     def __init__(self, margin=1.0):
         super().__init__()
         self.margin = margin
@@ -378,9 +374,13 @@ class WeightedTripletLoss(nn.Module):
             if len(neg_pair) < 1:
                 continue
 
-            pos_loss = torch.clamp(0.2 * torch.pow(pos_pair, 2) - 0.7 * pos_pair + 0.5, min=0)
+            pos_loss = torch.clamp(
+                0.2 * torch.pow(pos_pair, 2) - 0.7 * pos_pair + 0.5, min=0
+            )
             neg_pair = max(neg_pair)
-            neg_loss = torch.clamp(0.9 * torch.pow(neg_pair, 2) - 0.4 * neg_pair + 0.03, min=0)
+            neg_loss = torch.clamp(
+                0.9 * torch.pow(neg_pair, 2) - 0.4 * neg_pair + 0.03, min=0
+            )
 
             loss.append(pos_loss + neg_loss)
         for i in range(size):
@@ -393,10 +393,14 @@ class WeightedTripletLoss(nn.Module):
             pos_pair = pos_pair_
             if len(neg_pair) < 1:
                 continue
-            pos_loss = torch.clamp(0.2 * torch.pow(pos_pair, 2) - 0.7 * pos_pair + 0.5, min=0)
+            pos_loss = torch.clamp(
+                0.2 * torch.pow(pos_pair, 2) - 0.7 * pos_pair + 0.5, min=0
+            )
 
             neg_pair = max(neg_pair)
-            neg_loss = torch.clamp(0.9 * torch.pow(neg_pair, 2) - 0.4 * neg_pair + 0.03, min=0)
+            neg_loss = torch.clamp(
+                0.9 * torch.pow(neg_pair, 2) - 0.4 * neg_pair + 0.03, min=0
+            )
             loss.append(pos_loss + neg_loss)
 
         if len(loss) == 0:
@@ -414,11 +418,7 @@ class WeightedTripletLoss(nn.Module):
 
 
 class MultipleLossSum(torch.nn.Module):
-
-    def __init__(self,
-                 names,
-                 weights,
-                 **loss_fns):
+    def __init__(self, names, weights, **loss_fns):
         super().__init__()
         self.names = names
         self.weights = weights
